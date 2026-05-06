@@ -199,9 +199,14 @@ module Clacky
               idx = tc["index"]
               tool_calls_map[idx] ||= { id: +"", type: "function", name: +"", arguments: +"" }
               entry = tool_calls_map[idx]
-              entry[:id]        << tc["id"]                       if tc["id"]
+              # id and name are complete values (sent once or repeated identically),
+              # NOT incrementally built like arguments — use = not <<.
+              # Using << would concatenate the same value across chunks,
+              # producing an illegally long call_id (900+ chars) on providers
+              # that repeat the id field in every streaming delta.
+              entry[:id]        = tc["id"]                       if tc["id"]
               entry[:type]       = tc["type"] || "function"
-              entry[:name]      << tc.dig("function", "name")     if tc.dig("function", "name")
+              entry[:name]      = tc.dig("function", "name")     if tc.dig("function", "name")
               entry[:arguments] << tc.dig("function", "arguments") if tc.dig("function", "arguments")
             end
           end

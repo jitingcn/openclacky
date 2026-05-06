@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "securerandom"
 
 module Clacky
   module MessageFormat
@@ -48,15 +49,25 @@ module Clacky
       # Responses API `input` array.  Assistant messages with embedded
       # tool_calls are expanded into separate function_call items.
       #
-      # @param messages [Array<Hash>] canonical messages
+      # When previous_response_id is provided, the API already knows about
+      # the conversation history up to that response — including any
+      # function_call items in the previous response's output.  The input
+      # array should only contain items that are NEW since that response
+      # (e.g. the latest user message and any function_call_output items
+      # for tool results).
+      #
+      # @param messages [Array<Hash>] canonical messages (only new items when
+      #   previous_response_id is set)
       # @param model    [String]
       # @param tools    [Array<Hash>] OpenAI-style tool definitions
       # @param max_tokens [Integer] maps to max_output_tokens
       # @param caching_enabled [Boolean] (unused: Responses API has its own caching)
       # @param vision_supported [Boolean] whether the target model accepts images
+      # @param previous_response_id [String, nil] previous response ID for
+      #   multi-turn continuity
       # @return [Hash]
-      def build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true)
-        input_items = messages.flat_map { |msg| convert_message_to_input_items(msg, vision_supported: vision_supported) }
+      def build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, previous_response_id: nil)
+        input_items = messages.flat_map { |msg| convert_message_to_input_items(msg, vision_supported: vision_supported, previous_response_id: previous_response_id) }
 
         body = {
           model: model,
@@ -65,8 +76,10 @@ module Clacky
           store: false
         }
 
+        body[:previous_response_id] = previous_response_id if previous_response_id
+
         if tools&.any?
-          body[:tools] = deep_clone(tools)
+          body[:tools] = tools.map { |t| convert_tool_to_responses_format(t) }
           body[:tool_choice] = "auto"
         end
 
@@ -77,10 +90,11 @@ module Clacky
       # Same as build_request_body but with stream: true.
       #
       # @return [Hash]
-      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true)
+      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, previous_response_id: nil)
         body = build_request_body(
           messages, model, tools, max_tokens, caching_enabled,
-          vision_supported: vision_supported
+          vision_supported: vision_supported,
+          previous_response_id: previous_response_id
         )
         body[:stream] = true
         body
@@ -95,33 +109,60 @@ module Clacky
       #   { role: "user",    content: "text" }    → [{ role: "user",    content: "text" }]
       #   { role: "assistant", content: "text", tool_calls: [...] }
       #     → content part (if present) as { role: "assistant", content: "text" }
-      #     → each tool_call as { type: "function_call", id:, call_id:, name:, arguments: }
+      #     → each tool_call as { type: "function_call", id:, call_id:, name:, arguments:, status: }
       #   { role: "tool", tool_call_id:, content: } → { type: "function_call_output", call_id:, output: }
+      #
+      # When previous_response_id is set, assistant messages are skipped
+      # entirely — the API already has them from the previous response.
       #
       # @param msg [Hash] canonical message
       # @param vision_supported [Boolean]
+      # @param previous_response_id [String, nil]
       # @return [Array<Hash>]
-      private def convert_message_to_input_items(msg, vision_supported:)
+      private def convert_message_to_input_items(msg, vision_supported:, previous_response_id: nil)
         case msg[:role]
         when "system", "user"
           content = canonicalize_content(msg[:content], vision_supported: vision_supported)
           [{ role: msg[:role], content: content }]
 
         when "assistant"
+          # When continuing via previous_response_id, the API already knows
+          # about all assistant messages and their function_call items from
+          # the previous response's output.  Re-sending them as input causes
+          # pairing-constraint violations (e.g. reasoning+message pairing).
+          return [] if previous_response_id
+
           items = []
           # Emit text content as a message item when present
           if msg[:content] && !msg[:content].to_s.empty?
             items << { role: "assistant", content: msg[:content].to_s }
           end
-          # Emit each tool call as a function_call item
+          # Emit each tool call as a function_call item.
+          # Tool calls may be stored in either flat format ({name:, arguments:})
+          # or wrapped format ({function: {name:, arguments:}}) — handle both.
+          #
+          # In the Responses API, function_call items need two IDs:
+          #   - id:      a unique item identifier (must start with "fc_")
+          #   - call_id: the LLM's call identifier (typically "call_xxx")
+          # Our canonical format only stores the LLM's call_id as tc[:id],
+          # so we generate a fresh fc_ ID for the id field.
+          #
+          # The status field is required by the API for function_call items
+          # in the input array.  Assistant-produced tool calls are always
+          # "completed" (the LLM has finished producing the call).
           if msg[:tool_calls].is_a?(Array)
             msg[:tool_calls].each do |tc|
+              func = tc[:function] || tc
+              name = func[:name] || tc[:name]
+              arguments = func[:arguments] || tc[:arguments]
+
               items << {
                 type: "function_call",
-                id: tc[:id],
+                id: "fc_#{SecureRandom.hex(12)}",
                 call_id: tc[:id],
-                name: tc[:name],
-                arguments: tc[:arguments].to_s
+                name: name,
+                arguments: arguments.to_s,
+                status: "completed"
               }
             end
           end
@@ -510,6 +551,19 @@ module Clacky
           .select { |c| c["type"] == "output_text" }
           .map { |c| c["text"] }
           .join
+      end
+
+      # Convert a tool definition from Chat Completions format to Responses API format.
+      # Chat Completions: { type: "function", function: { name:, description:, parameters: } }
+      # Responses API:    { type: "function", name:, description:, parameters: }
+      private def convert_tool_to_responses_format(tool)
+        func = tool[:function] || tool
+        {
+          type: "function",
+          name: func[:name] || tool[:name],
+          description: func[:description] || tool[:description],
+          parameters: func[:parameters] || tool[:parameters]
+        }
       end
 
       private def deep_clone(obj)

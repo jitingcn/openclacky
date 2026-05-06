@@ -17,6 +17,20 @@ module Clacky
       @model = model
       @stream = stream  # true = always stream, false = never stream, nil = auto
 
+      # Responses API state tracking for multi-turn conversation continuity.
+      # The Responses API is stateful — it expects previous_response_id to chain
+      # turns.  We track both the last response ID and the message count at the
+      # time of the last request so we can send only the delta on the next turn.
+      #
+      # Some proxies (OpenRouter, custom gateways) reject previous_response_id.
+      # @responses_supports_prev_id tracks whether the upstream accepts it:
+      #   nil  = unknown (will try on next turn)
+      #   true = supported
+      #   false = rejected — always send full history
+      @last_responses_id = nil
+      @last_responses_message_count = 0
+      @responses_supports_prev_id = nil
+
       # Resolve provider for capability + anthropic_format lookups (includes
       # clacky-* key fallback for local-debug proxy setups).
       provider_id = Providers.resolve_provider(base_url: @base_url, api_key: @api_key)
@@ -484,14 +498,28 @@ module Clacky
     # Send a tool-calling request via the Responses API (POST /v1/responses).
     # Tries non-streaming first; falls back to streaming on 400 errors that
     # mention "stream" (e.g. DeepSeek V4 requires streaming).
+    #
+    # Multi-turn continuity: after the first response we track
+    # @last_responses_id and only send NEW messages since the last request.
+    # The previous_response_id lets the API access the full conversation
+    # history without us having to re-send every assistant message and its
+    # function_call items — avoiding undocumented pairing-constraint errors.
+    #
+    # Graceful degradation: if the upstream rejects previous_response_id
+    # (common with OpenRouter and custom proxies), we fall back to sending
+    # the full history and remember not to try previous_response_id again.
     def send_responses_request(messages, model, tools, max_tokens, caching_enabled)
+      use_prev_id = @last_responses_id && @responses_supports_prev_id != false
+      new_messages = use_prev_id ? responses_delta_messages(messages) : messages
+
       body = MessageFormat::Responses.build_request_body(
-        messages, model, tools, max_tokens, caching_enabled,
-        vision_supported: @vision_supported
+        new_messages, model, tools, max_tokens, caching_enabled,
+        vision_supported: @vision_supported,
+        previous_response_id: use_prev_id ? @last_responses_id : nil
       )
       response = responses_connection.post("responses") { |r| r.body = body.to_json }
 
-      # Auto-fallback to streaming when the provider requires it
+      # Handle errors that warrant a different request strategy
       if response.status == 400
         error_body = begin
           JSON.parse(response.body)
@@ -499,6 +527,16 @@ module Clacky
           {}
         end
         error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+
+        # Provider doesn't support previous_response_id — retry with full history
+        if error_msg.match?(/previous_response_id/i)
+          @responses_supports_prev_id = false
+          @last_responses_id = nil
+          @last_responses_message_count = 0
+          return send_responses_request(messages, model, tools, max_tokens, caching_enabled)
+        end
+
+        # Provider requires streaming
         if error_msg.match?(/stream/i)
           return send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
         end
@@ -513,16 +551,28 @@ module Clacky
       end
 
       parsed_body = safe_json_parse(response.body, context: "LLM response")
+
+      # Track response ID and message count for next turn's delta.
+      # Only save previous_response_id when the upstream confirmed it works.
+      update_responses_state!(parsed_body, messages.size)
+
       MessageFormat::Responses.parse_response(parsed_body)
     end
 
     # Streaming variant of send_responses_request.  Reads the response body
     # via Faraday's on_data callback, accumulates SSE chunks, and parses
     # them into canonical format.
+    #
+    # Graceful degradation: same previous_response_id fallback as the
+    # non-streaming path.
     def send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      use_prev_id = @last_responses_id && @responses_supports_prev_id != false
+      new_messages = use_prev_id ? responses_delta_messages(messages) : messages
+
       body = MessageFormat::Responses.build_stream_request_body(
-        messages, model, tools, max_tokens, caching_enabled,
-        vision_supported: @vision_supported
+        new_messages, model, tools, max_tokens, caching_enabled,
+        vision_supported: @vision_supported,
+        previous_response_id: use_prev_id ? @last_responses_id : nil
       )
 
       chunks = []
@@ -533,10 +583,36 @@ module Clacky
         end
       end
 
+      # Handle previous_response_id rejection in streaming path too
+      if response.status == 400
+        error_body = begin
+          reconstructed = chunks.join
+          JSON.parse(reconstructed.empty? ? "{}" : reconstructed)
+        rescue
+          {}
+        end
+        error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+
+        if error_msg.match?(/previous_response_id/i)
+          @responses_supports_prev_id = false
+          @last_responses_id = nil
+          @last_responses_message_count = 0
+          return send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
+        end
+      end
+
       raise_error(response, chunks: chunks) unless response.status == 200
       check_html_response(response, chunks: chunks)
 
-      MessageFormat::Responses.parse_stream_response(chunks)
+      result = MessageFormat::Responses.parse_stream_response(chunks)
+
+      # Track response ID from the final completed event for next turn's delta.
+      # The response ID is embedded in the response.completed SSE event; we
+      # extract it from the parsed usage data if present, or from the raw body.
+      resp_id = extract_responses_id_from_stream(chunks)
+      update_responses_state!(nil, messages.size, response_id: resp_id) if resp_id
+
+      result
     end
 
     # Parse a simple (non-tool) Responses API response into text.
@@ -664,6 +740,57 @@ module Clacky
         conn.ssl.verify           = false
         conn.adapter Faraday.default_adapter
       end
+    end
+
+    # ── Responses API state tracking ───────────────────────────────────────────
+
+    # Return only the messages that are new since the last Responses API call.
+    # When @last_responses_id is set, the API already knows about all messages
+    # up to @last_responses_message_count (via previous_response_id).  Only
+    # send the tail — typically the latest tool results and any new user messages.
+    private def responses_delta_messages(messages)
+      return messages unless @last_responses_id
+
+      messages[@last_responses_message_count..] || []
+    end
+
+    # Update the Responses API tracking state after a successful response.
+    # Called from both the non-streaming (has parsed_body with "id") and
+    # streaming (has explicit response_id) paths.
+    private def update_responses_state!(parsed_body, message_count, response_id: nil)
+      @last_responses_message_count = message_count
+      @last_responses_id = response_id || parsed_body&.dig("id")
+    end
+
+    # Extract the response ID from a streaming Responses API response.
+    # The ID is in the response.completed SSE event's data.response.id field.
+    private def extract_responses_id_from_stream(chunks)
+      body = chunks.join
+      # Look for "id":"resp_xxx" in the response.completed event data
+      body.each_line do |line|
+        next unless line.start_with?("data: ")
+
+        data_str = line[6..]
+        next if data_str.strip == "[DONE]"
+
+        parsed = begin
+          JSON.parse(data_str)
+        rescue JSON::ParserError
+          nil
+        end
+        next unless parsed.is_a?(Hash)
+
+        resp = parsed["response"]
+        return resp["id"] if resp.is_a?(Hash) && resp["id"]
+      end
+      nil
+    end
+
+    # Reset Responses API state — called when switching models or on error
+    # that requires a fresh conversation start.
+    def reset_responses_state!
+      @last_responses_id = nil
+      @last_responses_message_count = 0
     end
 
     def anthropic_connection

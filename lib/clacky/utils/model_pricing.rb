@@ -216,6 +216,26 @@ module Clacky
         }
       },
 
+      # GPT-5.3 Codex — breakpoint at 272K input tokens (same as GPT-5.5/GPT-5.4)
+      # Source: https://openai.com/api/pricing/ (USD / 1M tokens)
+      # Cache: write = input rate, read = 10% of input rate
+      "gpt-5.3-codex" => {
+        input: {
+          default: 1.75,              # $1.75/MTok for prompts ≤ 272K tokens
+          over_200k: 3.50             # $3.50/MTok for prompts > 272K tokens
+        },
+        output: {
+          default: 14.00,             # $14/MTok for prompts ≤ 272K tokens
+          over_200k: 21.00            # $21/MTok for prompts > 272K tokens
+        },
+        cache: {
+          write_default: 1.75,        # $1.75/MTok cache write (≤ 272K)
+          write_over_200k: 3.50,      # $3.50/MTok cache write (> 272K)
+          read_default: 0.175,        # $0.175/MTok cache read (≤ 272K)
+          read_over_200k: 0.35        # $0.35/MTok cache read (> 272K)
+        }
+      },
+
       # GPT-5.4 flat-rate models (no breakpoint, single rate regardless of context)
       "gpt-5.4-mini" => {
         input: {
@@ -518,6 +538,8 @@ module Clacky
         # (e.g. "gpt-5.5", "gpt-5-5", "gpt5.5", "gpt55")
         when /^gpt-?5\.?5$/i, /^gpt-?5[\.-]?5$/i
           "gpt-5.5"
+        when /^gpt-?5\.?3[\.-]?codex$/i, /^gpt-?5[\.-]3[\.-]?codex$/i
+          "gpt-5.3-codex"
         when /^gpt-?5\.?4[^.]*mini$/i, /^gpt-?5\.?4[\.-]?mini$/i
           "gpt-5.4-mini"
         when /^gpt-?5\.?4[^.]*nano$/i, /^gpt-?5\.?4[\.-]?nano$/i
