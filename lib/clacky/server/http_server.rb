@@ -379,6 +379,8 @@ module Clacky
         when ["POST",   "/api/cron-tasks"]    then api_create_cron_task(req, res)
         when ["GET",    "/api/skills"]         then api_list_skills(res)
         when ["GET",    "/api/config"]        then api_get_config(res)
+        when ["GET",    "/api/settings"]      then api_get_settings(res)
+        when ["PATCH",  "/api/settings"]      then api_update_settings(req, res)
         when ["POST",   "/api/config/models"] then api_add_model(req, res)
         when ["POST",   "/api/config/test"]   then api_test_config(req, res)
         when ["GET",    "/api/providers"]     then api_list_providers(res)
@@ -2656,6 +2658,8 @@ module Clacky
             base_url:         m["base_url"],
             api_key_masked:   mask_api_key(m["api_key"]),
             anthropic_format: m["anthropic_format"] || false,
+            api_type:         m["api_type"],
+            stream:           m.key?("stream") ? m["stream"] : nil,
             type:             m["type"]
           }
         end
@@ -2666,6 +2670,66 @@ module Clacky
           current_index: @agent_config.current_model_index,
           current_id: @agent_config.current_model&.dig("id")
         })
+      end
+
+      # GET /api/settings — return all configurable settings (compression, memory, etc.)
+      def api_get_settings(res)
+        json_response(res, 200, {
+          settings: {
+            enable_compression:             @agent_config.enable_compression,
+            enable_prompt_caching:          @agent_config.enable_prompt_caching,
+            memory_update_enabled:          @agent_config.memory_update_enabled,
+            skill_evolution:                @agent_config.skill_evolution,
+            compression_token_threshold:    @agent_config.compression_token_threshold,
+            compression_message_threshold:  @agent_config.compression_message_threshold,
+            compression_max_recent_messages: @agent_config.compression_max_recent_messages,
+            compression_target_tokens:      @agent_config.compression_target_tokens,
+            idle_compression_threshold:     @agent_config.idle_compression_threshold,
+            idle_compression_delay:         @agent_config.idle_compression_delay
+          }
+        })
+      end
+
+      # PATCH /api/settings — update settings
+      # Body: { settings: { enable_compression: true, ... } }
+      # Only provided keys are updated; missing keys are left untouched.
+      def api_update_settings(req, res)
+        body = parse_json_body(req)
+        return json_response(res, 400, { error: "Invalid JSON" }) unless body
+        return json_response(res, 400, { error: "settings object is required" }) unless body["settings"].is_a?(Hash)
+
+        settings = body["settings"]
+
+        # Boolean settings
+        %w[enable_compression enable_prompt_caching memory_update_enabled].each do |key|
+          if settings.key?(key)
+            @agent_config.send(:"#{key}=", settings[key])
+          end
+        end
+
+        # Integer settings
+        %w[
+          compression_token_threshold compression_message_threshold
+          compression_max_recent_messages compression_target_tokens
+          idle_compression_threshold idle_compression_delay
+        ].each do |key|
+          if settings.key?(key)
+            val = settings[key]
+            @agent_config.send(:"#{key}=", val.to_i) if val
+          end
+        end
+
+        # skill_evolution (hash)
+        if settings.key?("skill_evolution") && settings["skill_evolution"].is_a?(Hash)
+          se = settings["skill_evolution"].transform_keys(&:to_sym)
+          se.transform_values! { |v| v.is_a?(Hash) ? v.transform_keys(&:to_sym) : v }
+          @agent_config.skill_evolution = se
+        end
+
+        @agent_config.save
+        json_response(res, 200, { ok: true })
+      rescue => e
+        json_response(res, 422, { error: e.message })
       end
 
       # POST /api/config — save updated model list
@@ -2704,8 +2768,10 @@ module Clacky
           "model"            => model,
           "base_url"         => base_url,
           "api_key"          => api_key,
-          "anthropic_format" => body["anthropic_format"] || false
-        }
+          "anthropic_format" => body["anthropic_format"] || false,
+          "api_type"         => body["api_type"],
+          "stream"           => body.key?("stream") ? body["stream"] : nil
+        }.compact
         type = body["type"].to_s
         unless type.empty?
           # Preserve the single-slot "default" invariant.
@@ -2764,6 +2830,15 @@ module Clacky
         end
         if body.key?("anthropic_format")
           target["anthropic_format"] = !!body["anthropic_format"]
+        end
+        # api_type: "openai-completions", "openai-responses", "anthropic-messages", "bedrock", "" (auto-detect)
+        if body.key?("api_type")
+          val = body["api_type"].to_s.strip
+          target["api_type"] = val.empty? ? nil : val
+        end
+        # stream: true (always streaming), false (never streaming), null (auto — try non-streaming first)
+        if body.key?("stream")
+          target["stream"] = body["stream"]
         end
         if body.key?("api_key")
           new_key = body["api_key"].to_s
@@ -3728,7 +3803,8 @@ module Clacky
       private def build_idle_timer(session_id, agent)
         Clacky::IdleCompressionTimer.new(
           agent:           agent,
-          session_manager: @session_manager
+          session_manager: @session_manager,
+          idle_delay:      agent.instance_variable_get(:@config)&.idle_compression_delay || 180
         ) do |_success|
           broadcast_session_update(session_id)
         end
