@@ -30,6 +30,12 @@ module Clacky
         
         detected = detect_via_active_port_file
         
+        # Fallback: scan common remote-debugging ports (headless Chrome may not write ActivePort file)
+        unless detected
+          Clacky::Logger.debug("[BrowserDetector] ActivePort scan failed, trying port scan fallback...")
+          detected = detect_via_port_scan
+        end
+        
         unless detected
           Clacky::Logger.warn("[BrowserDetector] ✗ No reachable browser found")
           return { status: :not_found }
@@ -37,6 +43,74 @@ module Clacky
         
         Clacky::Logger.info("[BrowserDetector] ✓ Browser detected and reachable: #{detected[:mode]} → #{detected[:value]}")
         detected.merge(status: :ok)
+      end
+
+      # -----------------------------------------------------------------------
+      # Port scan fallback (for headless Chrome that doesn't write ActivePort)
+      # -----------------------------------------------------------------------
+
+      # Scan common remote-debugging ports by hitting /json/version.
+      # Headless Chrome with --remote-debugging-port may not create DevToolsActivePort.
+      # @return [Hash, nil] { mode: :ws_endpoint, value: String }
+      private_class_method def self.detect_via_port_scan
+        ports = load_scan_ports
+        Clacky::Logger.debug("[BrowserDetector] Scanning ports: #{ports.join(', ')}")
+
+        ports.each do |port|
+          next unless tcp_open?("127.0.0.1", port)
+
+          ws = fetch_ws_endpoint(port)
+          next unless ws
+
+          Clacky::Logger.debug("[BrowserDetector] Port scan found browser on port #{port}: #{ws}")
+          return { mode: :ws_endpoint, value: ws }
+        end
+
+        nil
+      end
+
+      # Get list of ports to scan. Reads from browser.yml chrome_port if configured,
+      # otherwise scans default range.
+      # @return [Array<Integer>]
+      def self.load_scan_ports
+        configured = configured_chrome_port
+        return [configured] if configured && configured > 0
+
+        # Default: scan 9222-9230 (covers common custom ports)
+        (9222..9230).to_a
+      end
+
+      # Read chrome_port from browser.yml config.
+      # @return [Integer, nil]
+      private_class_method def self.configured_chrome_port
+        cfg = Clacky::BrowserManager.instance.load_config_for_detector
+        port = cfg["chrome_port"]
+        port.to_i if port && port.to_i > 0
+      rescue StandardError
+        nil
+      end
+
+      # Fetch WebSocket debugger URL from a Chrome devtools HTTP endpoint.
+      # @param port [Integer]
+      # @return [String, nil] ws:// URL string
+      def self.fetch_ws_endpoint(port)
+        require "net/http"
+        require "json"
+
+        uri = URI("http://127.0.0.1:#{port}/json/version")
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.open_timeout = 1
+        http.read_timeout = 1
+
+        response = http.get(uri.request_uri)
+        return nil unless response.code.to_i == 200
+
+        data = JSON.parse(response.body)
+        ws = data["webSocketDebuggerUrl"]
+        ws if ws.is_a?(String) && !ws.empty?
+      rescue StandardError => e
+        Clacky::Logger.debug("[BrowserDetector] Port #{port} fetch failed: #{e.message}")
+        nil
       end
 
       # -----------------------------------------------------------------------
@@ -119,12 +193,36 @@ module Clacky
       end
 
       # WSL: Chrome/Edge may run on Windows side OR inside WSL2 (Linux Chrome).
-      # First try Windows-side paths via LOCALAPPDATA, then fall back to
-      # standard Linux Chrome paths for WSL2-native Chrome instances.
+      # Respects wsl_browser_mode config from browser.yml:
+      #   "windows" (default) → only scan Windows-side Chrome/Edge paths
+      #   "linux"             → only scan Linux-native Chrome paths
       private_class_method def self.wsl_user_data_dirs
+        mode = wsl_browser_mode
+        Clacky::Logger.debug("[BrowserDetector] WSL browser mode: #{mode}")
+
+        case mode
+        when "linux"  then linux_user_data_dirs
+        when "windows" then wsl_windows_user_data_dirs
+        else
+          # Fallback: try both (backward compatible)
+          wsl_windows_user_data_dirs + linux_user_data_dirs
+        end
+      end
+
+      # Read wsl_browser_mode from browser.yml via BrowserManager.
+      # Defaults to "windows" if not configured or on non-WSL.
+      # @return [String] "windows" or "linux"
+      private_class_method def self.wsl_browser_mode
+        Clacky::BrowserManager.instance.wsl_browser_mode
+      rescue StandardError
+        "windows"
+      end
+
+      # Scan Windows-side Chrome/Edge (via LOCALAPPDATA → wslpath).
+      # @return [Array<String>]
+      private_class_method def self.wsl_windows_user_data_dirs
         dirs = []
 
-        # 1. Try Windows-side Chrome/Edge (via LOCALAPPDATA)
         begin
           appdata = Timeout.timeout(3) do
             Utils::Encoding.cmd_to_utf8(
@@ -156,9 +254,6 @@ module Clacky
             end
           end
         end
-
-        # 2. Also check Linux-native Chrome paths (for Chrome running inside WSL2)
-        dirs.concat(linux_user_data_dirs)
 
         dirs
       end
