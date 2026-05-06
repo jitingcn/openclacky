@@ -1,5 +1,8 @@
 # frozen_string_literal: true
 
+# logger was removed from Ruby 4.0 stdlib; faraday needs it
+require "logger"
+
 require "faraday"
 require "json"
 
@@ -8,15 +11,52 @@ module Clacky
     MAX_RETRIES = 10
     RETRY_DELAY = 5 # seconds
 
-    def initialize(api_key, base_url:, model:, anthropic_format: false)
+    def initialize(api_key, base_url:, model:, anthropic_format: false, api_type: nil, stream: nil)
       @api_key = api_key
       @base_url = base_url
       @model = model
-      # Detect Bedrock: ABSK key prefix (native AWS) or abs- model prefix (Clacky AI proxy)
-      @use_bedrock = MessageFormat::Bedrock.bedrock_api_key?(api_key, model)
+      @stream = stream  # true = always stream, false = never stream, nil = auto
 
-      # Resolve provider once — reused for capability + api-type lookups.
+      # Resolve provider for capability + anthropic_format lookups (includes
+      # clacky-* key fallback for local-debug proxy setups).
       provider_id = Providers.resolve_provider(base_url: @base_url, api_key: @api_key)
+
+      # ── api_type resolution (explicit config > anthropic_format back-compat > base_url match) ──
+      # Only auto-detect api_type from provider preset when base_url explicitly
+      # matches — do NOT use the clacky-* key fallback (it would incorrectly
+      # route a localhost proxy to Bedrock when the user is using Chat Completions).
+      resolved_api_type = api_type
+      base_url_provider_id = Providers.find_by_base_url(@base_url)
+
+      if resolved_api_type.nil? || resolved_api_type.to_s.strip.empty?
+        # Backward compatibility: anthropic_format=true implies api_type="anthropic-messages"
+        if anthropic_format
+          resolved_api_type = "anthropic-messages"
+        else
+          # Auto-detect from provider preset (only when base_url matches)
+          resolved_api_type = base_url_provider_id ? Providers.api_type(base_url_provider_id) : nil
+        end
+      end
+
+      # ── Set routing flags from resolved api_type ──
+      @use_anthropic_format = false
+      @use_bedrock = false
+      @use_responses = false
+
+      case resolved_api_type
+      when "anthropic-messages"
+        @use_anthropic_format = true
+      when "bedrock"
+        @use_bedrock = true
+      when "openai-responses"
+        @use_responses = true
+      when "openai-completions", nil
+        # Chat Completions (default path) — nothing special needed
+      end
+
+      # Also run the legacy Bedrock detection as a safety net
+      # (ABSK key prefix or abs- model prefix)
+      @use_bedrock ||= MessageFormat::Bedrock.bedrock_api_key?(api_key, model)
 
       # Decide anthropic_format dynamically based on provider+model, falling
       # back to the explicit constructor flag for unknown providers / custom
@@ -63,6 +103,10 @@ module Clacky
         minimal_body = { model: model, max_tokens: 16,
                          messages: [{ role: "user", content: "hi" }] }.to_json
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = minimal_body }
+      elsif @use_responses
+        minimal_body = { model: model, max_output_tokens: 16, store: false,
+                         input: [{ role: "user", content: "hi" }] }.to_json
+        response = responses_connection.post("responses") { |r| r.body = minimal_body }
       else
         minimal_body = { model: model, max_tokens: 16,
                          messages: [{ role: "user", content: "hi" }] }.to_json
@@ -93,10 +137,74 @@ module Clacky
       elsif anthropic_format?
         body     = MessageFormat::Anthropic.build_request_body(messages, model, [], max_tokens, false)
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
+        # Fall back to Responses API when Anthropic endpoint requires streaming
+        if response.status == 400
+          error_body = begin; JSON.parse(response.body); rescue; {}; end
+          error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+          if error_msg.match?(/stream/i)
+            @use_responses = true
+            body2 = { model: model, max_output_tokens: max_tokens, store: false, input: messages }
+            resp2 = responses_connection.post("responses") { |r| r.body = body2.to_json }
+            return html_response?(resp2) ? parse_simple_responses_stream_response(model, messages, max_tokens) : parse_simple_responses_response(resp2)
+          end
+        end
+        if html_response?(response)
+          @use_responses = true
+          body2 = { model: model, max_output_tokens: max_tokens, store: false, input: messages }
+          resp2 = responses_connection.post("responses") { |r| r.body = body2.to_json }
+          return html_response?(resp2) ? parse_simple_responses_stream_response(model, messages, max_tokens) : parse_simple_responses_response(resp2)
+        end
         parse_simple_anthropic_response(response)
+      elsif @use_responses
+        body     = { model: model, max_output_tokens: max_tokens, store: false, input: messages }
+        response = responses_connection.post("responses") { |r| r.body = body.to_json }
+        if response.status == 400
+          error_body = begin; JSON.parse(response.body); rescue; {}; end
+          error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+          return parse_simple_responses_stream_response(model, messages, max_tokens) if error_msg.match?(/stream/i)
+        end
+        # HTML response → streaming fallback
+        if html_response?(response)
+          return parse_simple_responses_stream_response(model, messages, max_tokens)
+        end
+        parse_simple_responses_response(response)
       else
-        body     = { model: model, max_tokens: max_tokens, messages: messages }
-        response = openai_connection.post("chat/completions") { |r| r.body = body.to_json }
+        body = { model: model, max_tokens: max_tokens, messages: messages }
+
+        # If user explicitly configured stream: true, skip the non-streaming
+        # attempt entirely — go straight to streaming (saves 15s timeout wait).
+        if @stream == true
+          return parse_simple_openai_stream_response(model, messages, max_tokens)
+        end
+
+        # Try non-streaming first with a short timeout (15s).  Some servers
+        # hang on non-streaming requests because they're streaming-only —
+        # catch the timeout and retry with streaming.
+        response = begin
+          openai_connection.post("chat/completions") { |r| r.body = body.to_json; r.options.timeout = 15 }
+        rescue Faraday::TimeoutError
+          raise if @stream == false
+          return parse_simple_openai_stream_response(model, messages, max_tokens)
+        end
+
+        # Detect providers that return "Stream must be set to true" and
+        # retry with the streaming endpoint.
+        if response.status == 400
+          error_body = begin; JSON.parse(response.body); rescue; {}; end
+          error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+          if error_msg.match?(/stream/i)
+            raise RetryableError, "Provider requires streaming but stream is forced off" if @stream == false
+            return parse_simple_openai_stream_response(model, messages, max_tokens)
+          end
+        end
+
+        # If the non-streaming response is HTML (streaming-only server),
+        # fallback to streaming instead of retrying infinitely.
+        if html_response?(response)
+          raise RetryableError, "Provider requires streaming but stream is forced off" if @stream == false
+          return parse_simple_openai_stream_response(model, messages, max_tokens)
+        end
+
         parse_simple_openai_response(response)
       end
     end
@@ -107,25 +215,30 @@ module Clacky
     # Returns canonical response hash: { content:, tool_calls:, finish_reason:, usage:, latency: }
     #
     # Latency measurement:
-    #   Because the current HTTP path is *non-streaming* (plain POST, response
-    #   body read in one shot), TTFB (time to response headers) is not exposed
-    #   by Faraday's default adapter without extra plumbing. What we CAN measure
-    #   cheaply — and what users actually feel — is total request duration,
-    #   which for a non-streaming call equals the time from "hit Enter" to
-    #   "first token visible" (since we receive everything at once).
+    #   The primary path is non-streaming (plain POST, response body read in
+    #   one shot).  Providers that require streaming (e.g. DeepSeek V4) are
+    #   handled via an automatic fallback to SSE streaming; the result is
+    #   accumulated and returned identically.  TTFB (time to response headers)
+    #   is not exposed by Faraday's default adapter without extra plumbing.
+    #   What we CAN measure cheaply — and what users actually feel — is total
+    #   request duration, which for a non-streaming call equals the time from
+    #   "hit Enter" to "first token visible" (since we receive everything at
+    #   once).
     #
     #   So we record `duration_ms` as the authoritative number and alias it to
     #   `ttft_ms` for downstream consumers (status bar uses ttft_ms as its
-    #   signal metric — see docs). When we migrate to streaming later, this
-    #   same `ttft_ms` field will start carrying the *actual* first-token
-    #   latency without any schema change.
+    #   signal metric — see docs).  When we add full streaming support (with
+    #   incremental UI), this same `ttft_ms` field will start carrying the
+    #   *actual* first-token latency without any schema change.
     def send_messages_with_tools(messages, model:, tools:, max_tokens:, enable_caching: false)
       caching_enabled = enable_caching && supports_prompt_caching?(model)
       cloned = deep_clone(messages)
 
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       response =
-        if bedrock?
+        if @use_responses
+          send_responses_request(cloned, model, tools, max_tokens, caching_enabled)
+        elsif bedrock?
           send_bedrock_request(cloned, model, tools, max_tokens, caching_enabled)
         elsif anthropic_format?
           send_anthropic_request(cloned, model, tools, max_tokens, caching_enabled)
@@ -160,7 +273,9 @@ module Clacky
     def format_tool_results(response, tool_results, model:)
       return [] if tool_results.empty?
 
-      if bedrock?
+      if @use_responses
+        MessageFormat::Responses.format_tool_results(response, tool_results)
+      elsif bedrock?
         MessageFormat::Bedrock.format_tool_results(response, tool_results)
       elsif anthropic_format?
         MessageFormat::Anthropic.format_tool_results(response, tool_results)
@@ -223,6 +338,27 @@ module Clacky
       body     = MessageFormat::Anthropic.build_request_body(messages, model, tools, max_tokens, caching_enabled)
       response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
 
+      # Some providers require streaming even for Anthropic-format endpoints.
+      # When we get a 400 with "stream" in the error, fall back to Responses API.
+      if response.status == 400
+        error_body = begin
+          JSON.parse(response.body)
+        rescue
+          {}
+        end
+        error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+        if error_msg.match?(/stream/i)
+          @use_responses = true
+          return send_responses_request(messages, model, tools, max_tokens, caching_enabled)
+        end
+      end
+
+      # When Anthropic endpoint returns HTML, it doesn't exist — fall back to Responses API
+      if html_response?(response)
+        @use_responses = true
+        return send_responses_request(messages, model, tools, max_tokens, caching_enabled)
+      end
+
       raise_error(response) unless response.status == 200
       check_html_response(response)
       parsed_body = safe_json_parse(response.body, context: "LLM response")
@@ -242,23 +378,197 @@ module Clacky
       # OpenRouter proxies Claude with the same cache_control field convention as Anthropic direct.
       messages = apply_message_caching(messages) if caching_enabled
 
+      # If user explicitly configured stream: true, skip the non-streaming
+      # attempt entirely — go straight to streaming (saves 15s timeout wait).
+      if @stream == true
+        return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      end
+
       body     = MessageFormat::OpenAI.build_request_body(
         messages, model, tools, max_tokens, caching_enabled,
         vision_supported: @vision_supported
       )
-      response = openai_connection.post("chat/completions") { |r| r.body = body.to_json }
+
+      # Try non-streaming first with a short timeout (15s).  Some providers
+      # hang on non-streaming requests because they're streaming-only —
+      # catch the timeout and retry with streaming.
+      response = begin
+        openai_connection.post("chat/completions") { |r| r.body = body.to_json; r.options.timeout = 15 }
+      rescue Faraday::TimeoutError
+        # When stream: false (forced), don't fallback — propagate the error
+        raise if @stream == false
+        return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      end
+
+      # Detect providers that return "Stream must be set to true" (e.g. DeepSeek
+      # V4) and retry with streaming — the accumulated result is identical.
+      if response.status == 400
+        error_body = begin
+          JSON.parse(response.body)
+        rescue
+          {}
+        end
+        error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+        if error_msg.match?(/stream/i)
+          raise RetryableError, "Provider requires streaming but stream is forced off" if @stream == false
+          return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+        end
+      end
 
       raise_error(response) unless response.status == 200
-      check_html_response(response)
+
+      # If non-streaming returned HTML (streaming-only server),
+      # fallback to streaming instead of getting stuck in a retry loop.
+      if html_response?(response)
+        raise RetryableError, "Provider requires streaming but stream is forced off" if @stream == false
+        return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      end
       
       parsed_body = safe_json_parse(response.body, context: "LLM response")
       MessageFormat::OpenAI.parse_response(parsed_body)
+    end
+
+    # Streaming variant of send_openai_request for providers that require
+    # stream: true (e.g. DeepSeek V4).  Reads the response body via Faraday's
+    # on_data callback, accumulates SSE chunks, and parses them into the same
+    # canonical format as the non-streaming path.
+    def send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      body = MessageFormat::OpenAI.build_stream_request_body(
+        messages, model, tools, max_tokens, caching_enabled,
+        vision_supported: @vision_supported
+      )
+
+      chunks = []
+      response = openai_connection.post("chat/completions") do |req|
+        req.body = body.to_json
+        req.options.on_data = proc do |chunk, _bytes, _env|
+          chunks << chunk if chunk
+        end
+      end
+
+      raise_error(response, chunks: chunks) unless response.status == 200
+      check_html_response(response, chunks: chunks)
+
+      MessageFormat::OpenAI.parse_stream_response(chunks)
     end
 
     def parse_simple_openai_response(response)
       raise_error(response) unless response.status == 200
       parsed_body = safe_json_parse(response.body, context: "LLM response")
       parsed_body["choices"].first["message"]["content"]
+    end
+
+    # Streaming variant of parse_simple_openai_response for providers that
+    # require stream: true.  Returns the accumulated text content.
+    def parse_simple_openai_stream_response(model, messages, max_tokens)
+      body = { model: model, max_tokens: max_tokens, messages: messages,
+               stream: true, stream_options: { include_usage: true } }
+
+      chunks = []
+      response = openai_connection.post("chat/completions") do |req|
+        req.body = body.to_json
+        req.options.on_data = proc do |chunk, _bytes, _env|
+          chunks << chunk if chunk
+        end
+      end
+
+      raise_error(response, chunks: chunks) unless response.status == 200
+      check_html_response(response, chunks: chunks)
+
+      parsed = MessageFormat::OpenAI.parse_stream_response(chunks)
+      parsed[:content] || ""
+    end
+
+    # ── Responses API request / response ──────────────────────────────────────
+
+    # Send a tool-calling request via the Responses API (POST /v1/responses).
+    # Tries non-streaming first; falls back to streaming on 400 errors that
+    # mention "stream" (e.g. DeepSeek V4 requires streaming).
+    def send_responses_request(messages, model, tools, max_tokens, caching_enabled)
+      body = MessageFormat::Responses.build_request_body(
+        messages, model, tools, max_tokens, caching_enabled,
+        vision_supported: @vision_supported
+      )
+      response = responses_connection.post("responses") { |r| r.body = body.to_json }
+
+      # Auto-fallback to streaming when the provider requires it
+      if response.status == 400
+        error_body = begin
+          JSON.parse(response.body)
+        rescue
+          {}
+        end
+        error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+        if error_msg.match?(/stream/i)
+          return send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
+        end
+      end
+
+      raise_error(response) unless response.status == 200
+
+      # If non-streaming returned HTML (streaming-only server),
+      # fallback to streaming instead of getting stuck in a retry loop.
+      if html_response?(response)
+        return send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      end
+
+      parsed_body = safe_json_parse(response.body, context: "LLM response")
+      MessageFormat::Responses.parse_response(parsed_body)
+    end
+
+    # Streaming variant of send_responses_request.  Reads the response body
+    # via Faraday's on_data callback, accumulates SSE chunks, and parses
+    # them into canonical format.
+    def send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      body = MessageFormat::Responses.build_stream_request_body(
+        messages, model, tools, max_tokens, caching_enabled,
+        vision_supported: @vision_supported
+      )
+
+      chunks = []
+      response = responses_connection.post("responses") do |req|
+        req.body = body.to_json
+        req.options.on_data = proc do |chunk, _bytes, _env|
+          chunks << chunk if chunk
+        end
+      end
+
+      raise_error(response, chunks: chunks) unless response.status == 200
+      check_html_response(response, chunks: chunks)
+
+      MessageFormat::Responses.parse_stream_response(chunks)
+    end
+
+    # Parse a simple (non-tool) Responses API response into text.
+    def parse_simple_responses_response(response)
+      raise_error(response) unless response.status == 200
+      parsed_body = safe_json_parse(response.body, context: "LLM response")
+      output = parsed_body["output"] || []
+      output.select { |item| item["type"] == "message" }
+            .flat_map { |item| item["content"] || [] }
+            .select { |c| c["type"] == "output_text" }
+            .map { |c| c["text"] }
+            .join
+    end
+
+    # Streaming variant of parse_simple_responses_response.  Returns accumulated text.
+    def parse_simple_responses_stream_response(model, input_items, max_tokens)
+      body = { model: model, max_output_tokens: max_tokens, store: false,
+               input: input_items, stream: true }
+
+      chunks = []
+      response = responses_connection.post("responses") do |req|
+        req.body = body.to_json
+        req.options.on_data = proc do |chunk, _bytes, _env|
+          chunks << chunk if chunk
+        end
+      end
+
+      raise_error(response, chunks: chunks) unless response.status == 200
+      check_html_response(response, chunks: chunks)
+
+      parsed = MessageFormat::Responses.parse_stream_response(chunks)
+      parsed[:content] || ""
     end
 
     # ── Prompt caching helpers ────────────────────────────────────────────────
@@ -342,6 +652,20 @@ module Clacky
       end
     end
 
+    # Responses API connection shares the same auth and headers as Chat
+    # Completions (Bearer token, /v1 base) but POSTs to /v1/responses
+    # instead of /v1/chat/completions.
+    def responses_connection
+      @responses_connection ||= Faraday.new(url: @base_url) do |conn|
+        conn.headers["Content-Type"]  = "application/json"
+        conn.headers["Authorization"] = "Bearer #{@api_key}"
+        conn.options.timeout      = 300
+        conn.options.open_timeout = 10
+        conn.ssl.verify           = false
+        conn.adapter Faraday.default_adapter
+      end
+    end
+
     def anthropic_connection
       @anthropic_connection ||= Faraday.new(url: @base_url) do |conn|
         conn.headers["Content-Type"]   = "application/json"
@@ -403,9 +727,17 @@ module Clacky
       { success: false, error: extract_error_message(error_body, response.body) }
     end
 
-    def raise_error(response)
-      error_body    = JSON.parse(response.body) rescue nil
-      error_message = extract_error_message(error_body, response.body)
+    # When streaming (on_data callback consumed response.body), chunks contain
+    # the raw response data that would otherwise be in response.body.
+    def raise_error(response, chunks: nil)
+      raw_body = response.body.to_s
+      # Streaming: response.body may be empty (data consumed by on_data callback).
+      # Reconstruct the body from chunks to extract a meaningful error message.
+      if (raw_body.nil? || raw_body.strip.empty?) && chunks && chunks.any?
+        raw_body = chunks.join
+      end
+      error_body    = JSON.parse(raw_body) rescue nil
+      error_message = extract_error_message(error_body, raw_body)
 
       case response.status
       when 400
@@ -430,12 +762,35 @@ module Clacky
       end
     end
 
-    # Raise a friendly error if the response body is HTML (e.g. gateway error page returned with 200)
-    def check_html_response(response)
+    # Raise a friendly error if the response body is HTML (e.g. gateway error page returned with 200).
+    # When streaming, the response body is consumed by the on_data callback and ends up empty —
+    # in that case we also check the accumulated chunks for HTML content.
+    def check_html_response(response, chunks: nil)
       body = response.body.to_s.lstrip
-      if body.start_with?("<!DOCTYPE", "<!doctype", "<html", "<HTML")
+      if html_data?(body)
         raise RetryableError, "[LLM] Service temporarily unavailable (received HTML error page), retrying..."
       end
+      # Streaming: response.body may be empty (data consumed by on_data callback).
+      # Check the first accumulated chunk to catch HTML that was delivered via the stream.
+      if chunks
+        first_chunk = chunks.first.to_s.lstrip
+        if html_data?(first_chunk)
+          raise RetryableError, "[LLM] Service temporarily unavailable (received HTML error page via stream), retrying..."
+        end
+      end
+    end
+
+    # Returns true if a string looks like HTML (starts with DOCTYPE or html tag).
+    private def html_data?(str)
+      str.start_with?("<!DOCTYPE", "<!doctype", "<html", "<HTML")
+    end
+
+    # Returns true if the response body looks like HTML (not JSON).
+    # Used to detect when the Chat Completions endpoint doesn't exist on
+    # a server — in that case we can fall back to Responses API.
+    private def html_response?(response)
+      body = response.body.to_s.lstrip
+      html_data?(body)
     end
 
     def extract_error_message(error_body, raw_body)

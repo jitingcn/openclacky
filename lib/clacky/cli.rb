@@ -121,7 +121,9 @@ module Clacky
           agent_config.api_key,
           base_url: agent_config.base_url,
           model: agent_config.model_name,
-          anthropic_format: agent_config.anthropic_format?
+          anthropic_format: agent_config.anthropic_format?,
+          api_type: agent_config.api_type,
+          stream: agent_config.stream
         )
       end
 
@@ -220,7 +222,9 @@ module Clacky
             test_config.api_key,
             base_url: test_config.base_url,
             model: test_config.model_name,
-            anthropic_format: test_config.anthropic_format?
+            anthropic_format: test_config.anthropic_format?,
+            api_type: test_config.api_type,
+            stream: test_config.stream
           )
           test_client.test_connection(model: test_config.model_name)
         end
@@ -280,7 +284,20 @@ module Clacky
         ui_controller.append_output("  Current Model: #{config.model_name}")
         ui_controller.append_output("  API Key: #{masked_key}")
         ui_controller.append_output("  Base URL: #{config.base_url}")
-        ui_controller.append_output("  Format: #{config.anthropic_format? ? 'Anthropic' : 'OpenAI'}")
+        api_type_label = case config.api_type
+                         when "openai-completions" then "Chat Completions"
+                         when "openai-responses" then "Responses API"
+                         when "anthropic-messages" then "Anthropic Messages"
+                         when "bedrock" then "Bedrock"
+                         else "Auto-detect"
+                         end
+        stream_label = case config.stream
+                       when true then "Always"
+                       when false then "Never"
+                       else "Auto"
+                       end
+        ui_controller.append_output("  API Type: #{api_type_label}")
+        ui_controller.append_output("  Streaming: #{stream_label}")
         ui_controller.append_output("")
       end
 
@@ -756,10 +773,11 @@ module Clacky
         # Track current working thread (agent or idle compression that can be interrupted)
         current_task_thread = nil
 
-        # Idle compression timer - triggers compression after 180s of inactivity
+        # Idle compression timer - triggers compression after configurable idle delay
         idle_timer = Clacky::IdleCompressionTimer.new(
           agent:           agent,
           session_manager: session_manager,
+          idle_delay:      agent_config.idle_compression_delay,
           logger:          ->(msg, level:) { ui_controller.log(msg, level: level) }
         ) do |success|
           if success
@@ -850,6 +868,7 @@ module Clacky
             idle_timer = Clacky::IdleCompressionTimer.new(
               agent:           agent,
               session_manager: session_manager,
+              idle_delay:      agent_config.idle_compression_delay,
               logger:          ->(msg, level:) { ui_controller.log(msg, level: level) }
             ) do |success|
               if success
@@ -1035,7 +1054,9 @@ module Clacky
             agent_config.api_key,
             base_url: agent_config.base_url,
             model: agent_config.model_name,
-            anthropic_format: agent_config.anthropic_format?
+            anthropic_format: agent_config.anthropic_format?,
+            api_type: agent_config.api_type,
+            stream: agent_config.stream
           )
         end
 

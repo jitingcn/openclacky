@@ -151,7 +151,9 @@ module Clacky
         @config.api_key,
         base_url: @config.base_url,
         model: @config.model_name,
-        anthropic_format: @config.anthropic_format?
+        anthropic_format: @config.anthropic_format?,
+        api_type: @config.api_type,
+        stream: @config.stream
       )
       # Update message compressor with new client and model
       @message_compressor = MessageCompressor.new(@client, model: current_model)

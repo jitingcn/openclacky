@@ -3016,6 +3016,47 @@ body {
 }
 .settings-error { color: var(--color-error); }
 
+/* ── Compression Settings ─────────────────────────────────────────── */
+.settings-compression {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-primary);
+  border-radius: 10px;
+}
+.settings-compression-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.settings-compression-label {
+  font-size: 13px;
+  color: var(--color-text-primary);
+  flex: 1;
+}
+.settings-compression-input {
+  width: 110px;
+  padding: 4px 8px;
+  border: 1px solid var(--color-border-primary);
+  border-radius: 4px;
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-size: 13px;
+  text-align: right;
+}
+.settings-compression-unit {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  min-width: 60px;
+}
+.settings-save-status {
+  font-size: 12px;
+  margin-left: 8px;
+}
+
 /* ── Browser toggle switch ───────────────────────────────────────────────── */
 .settings-browser-actions {
   display: flex;

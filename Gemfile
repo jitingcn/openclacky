@@ -10,6 +10,9 @@ gem "rake", "~> 13.0"
 
 gem "debug"
 
+# logger was removed from Ruby 4.0 stdlib
+gem "logger"
+
 gem "rspec", "~> 3.0"
 gem "rubocop", "~> 1.21"
 gem "climate_control"
