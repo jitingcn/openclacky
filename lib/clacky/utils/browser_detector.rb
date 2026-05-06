@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "socket"
+require "timeout"
 
 module Clacky
   module Utils
@@ -117,26 +118,49 @@ module Clacky
         end
       end
 
-      # WSL: Chrome/Edge run on Windows side — resolve via LOCALAPPDATA.
+      # WSL: Chrome/Edge may run on Windows side OR inside WSL2 (Linux Chrome).
+      # First try Windows-side paths via LOCALAPPDATA, then fall back to
+      # standard Linux Chrome paths for WSL2-native Chrome instances.
       private_class_method def self.wsl_user_data_dirs
-        appdata = Utils::Encoding.cmd_to_utf8(
-          `powershell.exe -NoProfile -Command '$env:LOCALAPPDATA' 2>/dev/null`
-        ).strip.tr("\r\n", "")
-        return [] if appdata.empty?
+        dirs = []
 
-        win_paths = [
-          "#{appdata}\\Microsoft\\Edge\\User Data",
-          "#{appdata}\\Google\\Chrome\\User Data",
-          "#{appdata}\\Google\\Chrome Beta\\User Data",
-          "#{appdata}\\Google\\Chrome SxS\\User Data",
-        ]
-
-        win_paths.filter_map do |win_path|
-          linux_path = Utils::Encoding.cmd_to_utf8(
-            `wslpath '#{win_path}' 2>/dev/null`, source_encoding: "UTF-8"
-          ).strip
-          linux_path.empty? ? nil : linux_path
+        # 1. Try Windows-side Chrome/Edge (via LOCALAPPDATA)
+        begin
+          appdata = Timeout.timeout(3) do
+            Utils::Encoding.cmd_to_utf8(
+              `powershell.exe -NoProfile -Command '$env:LOCALAPPDATA' 2>/dev/null`
+            ).strip.tr("\r\n", "")
+          end
+        rescue Timeout::Error, StandardError
+          appdata = ""
         end
+
+        unless appdata.empty?
+          win_paths = [
+            "#{appdata}\\Microsoft\\Edge\\User Data",
+            "#{appdata}\\Google\\Chrome\\User Data",
+            "#{appdata}\\Google\\Chrome Beta\\User Data",
+            "#{appdata}\\Google\\Chrome SxS\\User Data",
+          ]
+
+          win_paths.each do |win_path|
+            begin
+              linux_path = Timeout.timeout(3) do
+                Utils::Encoding.cmd_to_utf8(
+                  `wslpath '#{win_path}' 2>/dev/null`, source_encoding: "UTF-8"
+                ).strip
+              end
+              dirs << linux_path unless linux_path.empty?
+            rescue Timeout::Error, StandardError
+              nil
+            end
+          end
+        end
+
+        # 2. Also check Linux-native Chrome paths (for Chrome running inside WSL2)
+        dirs.concat(linux_user_data_dirs)
+
+        dirs
       end
 
       # Linux: standard XDG config paths for Chrome and Edge.
