@@ -284,14 +284,16 @@ module Clacky
         usage[:cache_creation_input_tokens] = usage_data["cache_creation_input_tokens"] if usage_data["cache_creation_input_tokens"]
         usage[:cache_read_input_tokens]     = usage_data["cache_read_input_tokens"]     if usage_data["cache_read_input_tokens"]
 
-        # Responses API doesn't have an explicit finish_reason; default to "stop"
-        {
+        # Responses API doesn't have an explicit finish_reason; infer from tool_calls
+        finish_reason = tool_calls && !tool_calls.empty? ? "tool_calls" : "stop"
+        result = {
           content:       content,
           tool_calls:    tool_calls,
-          finish_reason: "stop",
+          finish_reason: finish_reason,
           usage:         usage,
           raw_api_usage: usage_data
         }
+        result
       end
 
       # ── Streaming response parsing ────────────────────────────────────────────
@@ -349,28 +351,37 @@ module Clacky
             reasoning << delta if delta
 
           when "response.function_call_arguments.delta"
-            # Arguments arrive incrementally; accumulate into current tool call
+            # Arguments arrive incrementally; accumulate into the current tool call.
+            # When the last entry already has an id (completed via .done / output_item.done),
+            # start a new entry — otherwise deltas for the next call would corrupt it.
             delta = event.dig(:data, "delta")
             if delta
-              tool_calls << { id: +"", type: "function", name: +"", arguments: +"" } if tool_calls.empty?
+              last_done = tool_calls.any? && !tool_calls.last[:id].to_s.empty?
+              tool_calls << { id: +"", type: "function", name: +"", arguments: +"" } if tool_calls.empty? || last_done
               tool_calls.last[:arguments] << delta
             end
 
           when "response.function_call_arguments.done"
             data = event[:data]
-            # The done event carries the complete name + arguments + call_id
-            # Replace the incrementally-accumulated entry if present
-            existing = tool_calls.find { |tc| tc[:id].empty? && tc[:arguments] == data["arguments"] }
+            # The done event carries the complete arguments + item_id, but
+            # name/call_id may arrive separately via response.output_item.done.
+            # Some providers nest name/call_id inside data["item"].
+            item = data["item"] || {}
+            name_from = item["name"] || data["name"] || ""
+            id_from   = item["call_id"] || item["id"] || data["call_id"] || data["id"] || ""
+            args_from = item["arguments"] || data["arguments"] || ""
+            # Find the most recent incomplete entry (name/id not yet set)
+            existing = tool_calls.reverse.find { |tc| tc[:name].to_s.empty? }
             if existing
-              existing[:id]        = data["call_id"] || data["id"] || ""
-              existing[:name]      = data["name"] || ""
-              existing[:arguments] = data["arguments"] || ""
+              existing[:id]        = id_from
+              existing[:name]      = name_from
+              existing[:arguments] = args_from
             else
               tool_calls << {
-                id:        data["call_id"] || data["id"],
+                id:        id_from,
                 type:      "function",
-                name:      data["name"],
-                arguments: data["arguments"].to_s
+                name:      name_from,
+                arguments: args_from
               }
             end
 
@@ -378,8 +389,8 @@ module Clacky
             item = event.dig(:data, "item") || {}
             case item["type"]
             when "function_call"
-              # Complete function_call item — replace any incremental entry
-              existing = tool_calls.find { |tc| tc[:id].empty? || tc[:id] == (item["call_id"] || item["id"]) }
+              # Complete function_call item — find the most recent incomplete entry
+              existing = tool_calls.reverse.find { |tc| tc[:name].to_s.empty? }
               if existing
                 existing[:id]        = item["call_id"] || item["id"] || ""
                 existing[:name]      = item["name"] || ""
@@ -418,6 +429,10 @@ module Clacky
         tool_calls = nil if tool_calls.empty?
 
         content = nil if content.empty?
+
+        # When tool_calls are present, override finish_reason to "tool_calls"
+        # so the agent loop knows to execute them before stopping.
+        finish_reason = "tool_calls" if tool_calls && !tool_calls.empty?
 
         usage = {
           prompt_tokens:     usage_data["input_tokens"],
