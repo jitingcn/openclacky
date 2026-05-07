@@ -1535,12 +1535,16 @@ module Clacky
             model_name = values[:model].to_s.empty? ? model["model"] : values[:model]
             base_url = values[:base_url].to_s.empty? ? model["base_url"] : values[:base_url]
             anthropic_format = model["anthropic_format"] # Not editable in form, use model's value
+            api_type = model["api_type"]
+            stream = model.key?("stream") ? model["stream"] : nil
             
             test_config_values = {
               "api_key" => api_key,
               "model" => model_name,
               "base_url" => base_url,
-              "anthropic_format" => anthropic_format
+              "anthropic_format" => anthropic_format,
+              "api_type" => api_type,
+              "stream" => stream
             }
             
             # For new models, require all fields

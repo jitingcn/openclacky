@@ -402,9 +402,23 @@ RSpec.describe Clacky::AgentConfig do
       expect(config.anthropic_format?).to be true
     end
 
+    it "returns true when explicit api_type is anthropic-messages even if legacy flag is false" do
+      config = described_class.new(
+        models: [{ "model" => "test", "anthropic_format" => false, "api_type" => "anthropic-messages" }]
+      )
+      expect(config.anthropic_format?).to be true
+    end
+
     it "returns false when anthropic_format is false" do
       config = described_class.new(
         models: [{ "model" => "test", "anthropic_format" => false }]
+      )
+      expect(config.anthropic_format?).to be false
+    end
+
+    it "returns false when explicit api_type is openai-completions even if legacy flag is true" do
+      config = described_class.new(
+        models: [{ "model" => "test", "anthropic_format" => true, "api_type" => "openai-completions" }]
       )
       expect(config.anthropic_format?).to be false
     end

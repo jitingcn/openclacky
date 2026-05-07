@@ -445,6 +445,7 @@ module Clacky
             if !task_auto_retried && @iterations == @task_start_iterations + 1 &&
                (response[:tool_calls].nil? || response[:tool_calls].empty?) &&
                response[:content] && !response[:content].empty? &&
+               !response[:after_truncation_retry] &&
                action_plan_without_tools?(response[:content])
               task_auto_retried = true
               @ui&.show_info("Model described intent without tool calls — auto-continuing...")
@@ -735,8 +736,12 @@ module Clacky
         @ui&.show_progress(phase: "done")
         @ui&.show_warning("Response truncated (#{@task_truncation_count}/3). Retrying with smaller steps...")
 
-        # Recursively retry
-        return think
+        # Recursively retry. Mark the recovered response so the outer run loop
+        # doesn't stack a second synthetic "use tools now" nudge on top of the
+        # truncation recovery prompt.
+        retried_response = think
+        retried_response[:after_truncation_retry] = true if retried_response.is_a?(Hash)
+        return retried_response
       end
 
       # Add assistant response to history
