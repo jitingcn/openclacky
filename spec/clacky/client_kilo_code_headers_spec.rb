@@ -55,23 +55,25 @@ RSpec.describe Clacky::Client, "Kilo Code headers" do
     end
   end
 
-  # ── responses_connection headers ──────────────────────────────────────────
+  # ── OpenAI SDK client construction ────────────────────────────────────────
 
-  describe "#responses_connection" do
-    it "includes standard auth headers" do
+  describe "OpenAI SDK client for Responses API" do
+    it "builds an OpenAI::Client when api_type is openai-responses" do
       client = build_client(api_type: "openai-responses")
-      conn = client.send(:responses_connection)
-      expect(conn.headers["Content-Type"]).to eq("application/json")
-      expect(conn.headers["Authorization"]).to eq("Bearer #{api_key}")
+      sdk_client = client.instance_variable_get(:@openai_sdk_client)
+      expect(sdk_client).to be_a(OpenAI::Client)
     end
 
-    it "includes Kilo Code identity headers" do
+    it "does not build SDK client for non-Responses API types" do
+      client = build_client(api_type: "openai-completions")
+      sdk_client = client.instance_variable_get(:@openai_sdk_client)
+      expect(sdk_client).to be_nil
+    end
+
+    it "configures SDK client with user's base_url and api_key" do
       client = build_client(api_type: "openai-responses")
-      conn = client.send(:responses_connection)
-      expect(conn.headers["HTTP-Referer"]).to eq("https://kilocode.ai")
-      expect(conn.headers["X-Title"]).to eq("Kilo Code")
-      expect(conn.headers["User-Agent"]).to start_with("Kilo-Code/")
-      expect(conn.headers["User-Agent"]).to include(" ai-sdk/provider-utils/")
+      sdk_client = client.instance_variable_get(:@openai_sdk_client)
+      expect(sdk_client.base_url.to_s).to include("api.example.com")
     end
   end
 

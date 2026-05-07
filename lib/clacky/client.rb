@@ -7,6 +7,7 @@ require "faraday"
 require "json"
 require "digest"
 require "securerandom"
+require "openai"
 
 module Clacky
   class Client
@@ -44,19 +45,8 @@ module Clacky
         session_id: @cache_affinity_session_id
       })
 
-      # Responses API state tracking for multi-turn conversation continuity.
-      # The Responses API is stateful — it expects previous_response_id to chain
-      # turns.  We track both the last response ID and the message count at the
-      # time of the last request so we can send only the delta on the next turn.
-      #
-      # Some proxies (OpenRouter, custom gateways) reject previous_response_id.
-      # @responses_supports_prev_id tracks whether the upstream accepts it:
-      #   nil  = unknown (will try on next turn)
-      #   true = supported
-      #   false = rejected — always send full history
-      @last_responses_id = nil
-      @last_responses_message_count = 0
-      @responses_supports_prev_id = nil
+      # Responses API state is now managed by the OpenAI SDK internally.
+      # previous_response_id and delta messages tracking are no longer needed.
 
       # Resolve provider for capability + anthropic_format lookups (includes
       # clacky-* key fallback for local-debug proxy setups).
@@ -123,6 +113,19 @@ module Clacky
       # Non-vision models (DeepSeek, Kimi, MiniMax, etc.) reject image_url
       # content blocks; the conversion layer strips them when this is false.
       @vision_supported = Providers.supports?(provider_id, :vision, model_name: @model)
+
+      # ── OpenAI SDK client for Responses API ──────────────────────────────────
+      # When the resolved api_type is "openai-responses", we delegate all
+      # Responses API calls to the official openai-ruby SDK instead of
+      # hand-rolling HTTP requests and SSE parsing.  The SDK provides proper
+      # streaming event parsing, type-safe responses, and built-in retries.
+      #
+      # For non-Responses paths (Chat Completions, Anthropic, Bedrock) we
+      # continue using Faraday directly — the SDK is only wired up here.
+      @openai_sdk_client = nil
+      if @use_responses
+        @openai_sdk_client = build_openai_client
+      end
     end
 
     # Returns true when the client is using the AWS Bedrock Converse API.
@@ -151,23 +154,22 @@ module Clacky
                          messages: [{ role: "user", content: "hi" }] }.to_json
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = minimal_body }
       elsif @use_responses
-        minimal_body = { model: model, max_output_tokens: 16, store: false,
-                         input: [{ role: "user", content: "hi" }] }
-        minimal_body[:stream] = true if @stream
-        response = responses_connection.post("responses") { |r| r.body = minimal_body.to_json }
-
-        # Auto mode: retry with streaming if server requires it
-        if response.status == 400 && @stream.nil?
-          error_body = begin
-            JSON.parse(response.body)
-          rescue
-            {}
-          end
-          error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
-          if error_msg.match?(/stream/i)
-            minimal_body[:stream] = true
-            response = responses_connection.post("responses") { |r| r.body = minimal_body.to_json }
-          end
+        begin
+          # Use stream_raw to test connection — works with both streaming-only
+          # and non-streaming proxies. Just consume the first event.
+          stream = @openai_sdk_client.responses.stream_raw(
+            model: model,
+            max_output_tokens: 16,
+            store: false,
+            input: [{ role: "user", content: "hi" }]
+          )
+          # Consume at least one event to confirm the connection works
+          stream.each { |_event| break }
+          return { success: true }
+        rescue OpenAI::Errors::APIStatusError => e
+          return { success: false, error: e.message }
+        rescue => e
+          return { success: false, error: e.message }
         end
       else
         minimal_body = { model: model, max_tokens: 16,
@@ -228,53 +230,63 @@ module Clacky
         body     = MessageFormat::Anthropic.build_request_body(messages, model, [], max_tokens, false)
         inject_cache_affinity!(body, :anthropic)
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
-        # Fall back to Responses API when Anthropic endpoint requires streaming
-        if response.status == 400
+        # Fall back to Responses API (via OpenAI SDK) when Anthropic endpoint
+        # requires streaming or returns HTML (endpoint doesn't exist).
+        if response.status == 400 || html_response?(response)
           error_body = begin; JSON.parse(response.body); rescue; {}; end
           error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
-          if error_msg.match?(/stream/i)
+          if error_msg.match?(/stream/i) || html_response?(response)
             @use_responses = true
-            body2 = { model: model, max_output_tokens: max_tokens, store: false, input: messages }
-            inject_cache_affinity!(body2, :responses)
-            resp2 = responses_connection.post("responses") { |r| r.body = body2.to_json }
-            return html_response?(resp2) ? parse_simple_responses_stream_response(model, messages, max_tokens) : parse_simple_responses_response(resp2)
+            @openai_sdk_client ||= build_openai_client
+            begin
+              sdk_resp = @openai_sdk_client.responses.create(
+                model: model, max_output_tokens: max_tokens,
+                store: false, input: messages,
+                prompt_cache_key: @cache_affinity_session_id
+              )
+              return extract_response_text(sdk_resp)
+            rescue OpenAI::Errors::BadRequestError => e
+              if e.message.include?("stream") || e.message.include?("Stream")
+                sdk_resp = stream_responses_via_sdk(
+                  model: model, max_output_tokens: max_tokens,
+                  store: false, input: messages,
+                  prompt_cache_key: @cache_affinity_session_id
+                )
+                return extract_response_text(sdk_resp)
+              end
+              raise map_sdk_error(e)
+            rescue OpenAI::Errors::APIStatusError => e
+              raise map_sdk_error(e)
+            end
           end
-        end
-        if html_response?(response)
-          @use_responses = true
-          body2 = { model: model, max_output_tokens: max_tokens, store: false, input: messages }
-          inject_cache_affinity!(body2, :responses)
-          resp2 = responses_connection.post("responses") { |r| r.body = body2.to_json }
-          return html_response?(resp2) ? parse_simple_responses_stream_response(model, messages, max_tokens) : parse_simple_responses_response(resp2)
         end
         parse_simple_anthropic_response(response)
       elsif @use_responses
-        # Default to streaming first unless user explicitly disables it.
-        # When stream is forced on (true), streaming failures propagate.
-        # When stream is nil (auto), fall back to non-streaming gracefully.
-        unless @stream == false
-          begin
-            return parse_simple_responses_stream_response(model, messages, max_tokens)
-          rescue StandardError
-            raise if @stream == true
-            # @stream == nil: streaming failed, fall through to non-streaming below
+        # Use OpenAI SDK for Responses API.
+        begin
+          sdk_resp = @openai_sdk_client.responses.create(
+            model: model,
+            max_output_tokens: max_tokens,
+            store: false,
+            input: messages,
+            prompt_cache_key: @cache_affinity_session_id
+          )
+          extract_response_text(sdk_resp)
+        rescue OpenAI::Errors::BadRequestError => e
+          # Proxy requires streaming — fallback to stream + get_final_response
+          if e.message.include?("stream") || e.message.include?("Stream")
+            sdk_resp = stream_responses_via_sdk(
+              model: model, max_output_tokens: max_tokens,
+              store: false, input: messages,
+              prompt_cache_key: @cache_affinity_session_id
+            )
+            extract_response_text(sdk_resp)
+          else
+            raise map_sdk_error(e)
           end
+        rescue OpenAI::Errors::APIStatusError => e
+          raise map_sdk_error(e)
         end
-
-        # Non-streaming path — either @stream == false or streaming fallback
-        body     = { model: model, max_output_tokens: max_tokens, store: false, input: messages }
-        inject_cache_affinity!(body, :responses)
-        response = responses_connection.post("responses") { |r| r.body = body.to_json }
-        if response.status == 400
-          error_body = begin; JSON.parse(response.body); rescue; {}; end
-          error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
-          return parse_simple_responses_stream_response(model, messages, max_tokens) if error_msg.match?(/stream/i)
-        end
-        # HTML response → streaming fallback
-        if html_response?(response)
-          return parse_simple_responses_stream_response(model, messages, max_tokens)
-        end
-        parse_simple_responses_response(response)
       else
         # Default to streaming first unless user explicitly disables it.
         # When stream is forced on (true), streaming failures propagate.
@@ -352,20 +364,7 @@ module Clacky
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       response =
         if @use_responses
-          # Default to streaming first unless user explicitly disables it.
-          # When stream is forced on (true), streaming failures propagate.
-          # When stream is nil (auto), fall back to non-streaming gracefully.
-          unless @stream == false
-            begin
-              send_responses_stream_request(cloned, model, tools, max_tokens, caching_enabled)
-            rescue StandardError
-              raise if @stream == true
-              # @stream == nil: streaming failed, fall back to non-streaming
-              send_responses_request(cloned, model, tools, max_tokens, caching_enabled)
-            end
-          else
-            send_responses_request(cloned, model, tools, max_tokens, caching_enabled)
-          end
+          send_sdk_responses_request(cloned, model, tools, max_tokens, caching_enabled)
         elsif bedrock?
           send_bedrock_request(cloned, model, tools, max_tokens, caching_enabled)
         elsif anthropic_format?
@@ -520,7 +519,7 @@ module Clacky
       }
 
       # Some providers require streaming even for Anthropic-format endpoints.
-      # When we get a 400 with "stream" in the error, fall back to streaming.
+      # When we get a 400 with "stream" in the error, fall back to Responses API via SDK.
       if response.status == 400
         error_body = begin
           JSON.parse(response.body)
@@ -530,14 +529,16 @@ module Clacky
         error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
         if error_msg.match?(/stream/i)
           @use_responses = true
-          return send_responses_request(messages, model, tools, max_tokens, caching_enabled)
+          @openai_sdk_client ||= build_openai_client
+          return send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled)
         end
       end
 
-      # When Anthropic endpoint returns HTML, it doesn't exist — fall back to Responses API
+      # When Anthropic endpoint returns HTML, it doesn't exist — fall back to Responses API via SDK
       if html_response?(response)
         @use_responses = true
-        return send_responses_request(messages, model, tools, max_tokens, caching_enabled)
+        @openai_sdk_client ||= build_openai_client
+        return send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled)
       end
 
       raise_error(response) unless response.status == 200
@@ -576,7 +577,8 @@ module Clacky
         error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
         if error_msg.match?(/stream/i)
           @use_responses = true
-          return send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
+          @openai_sdk_client ||= build_openai_client
+          return send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled)
         end
       end
 
@@ -760,169 +762,278 @@ module Clacky
       parsed[:content] || ""
     end
 
-    # ── Responses API request / response ──────────────────────────────────────
-
-    # Send a tool-calling request via the Responses API (POST /v1/responses).
-    # Tries non-streaming first; falls back to streaming on 400 errors that
-    # mention "stream" (e.g. DeepSeek V4 requires streaming).
+    # ── Responses API via OpenAI SDK ──────────────────────────────────────────
     #
-    # Multi-turn continuity: after the first response we track
-    # @last_responses_id and only send NEW messages since the last request.
-    # The previous_response_id lets the API access the full conversation
-    # history without us having to re-send every assistant message and its
-    # function_call items — avoiding undocumented pairing-constraint errors.
-    #
-    # Graceful degradation: if the upstream rejects previous_response_id
-    # (common with OpenRouter and custom proxies), we fall back to sending
-    # the full history and remember not to try previous_response_id again.
-    def send_responses_request(messages, model, tools, max_tokens, caching_enabled)
-      use_prev_id = @last_responses_id && @responses_supports_prev_id != false
-      new_messages = use_prev_id ? responses_delta_messages(messages) : messages
+    # All Responses API calls are delegated to the official openai-ruby SDK,
+    # which handles SSE parsing, event typing, and retries correctly.
+    # We only need to:
+    #   1. Build the request params (reusing MessageFormat::Responses)
+    #   2. Call the SDK
+    #   3. Convert the SDK's typed response to our canonical hash format
 
-      body = MessageFormat::Responses.build_request_body(
-        new_messages, model, tools, max_tokens, caching_enabled,
-        vision_supported: @vision_supported,
-        previous_response_id: use_prev_id ? @last_responses_id : nil
+    # Send a Responses API request via the OpenAI SDK.
+    # Returns canonical response hash: { content:, tool_calls:, finish_reason:, usage:, raw_api_usage: }
+    #
+    # Strategy: try non-streaming first (SDK's create).  Some proxies
+    # (e.g. 211server) require stream: true and reject non-streaming with
+    # 400.  When that happens, fall back to SDK's stream() + until_done.
+    def send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled)
+      input_items = MessageFormat::Responses.build_input_items(
+        messages, vision_supported: @vision_supported
       )
-      inject_cache_affinity!(body, :responses)
-      response = responses_connection.post("responses") { |r| r.body = body.to_json }
 
-      # Handle errors that warrant a different request strategy
-      if response.status == 400
-        error_body = begin
-          JSON.parse(response.body)
-        rescue
-          {}
-        end
-        error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+      params = {
+        model: model,
+        input: input_items,
+        max_output_tokens: max_tokens,
+        store: false,
+        prompt_cache_key: @cache_affinity_session_id
+      }
 
-        # Provider doesn't support previous_response_id — retry with full history
-        if error_msg.match?(/previous_response_id/i)
-          @responses_supports_prev_id = false
-          @last_responses_id = nil
-          @last_responses_message_count = 0
-          return send_responses_request(messages, model, tools, max_tokens, caching_enabled)
-        end
-
-        # Provider requires streaming
-        if error_msg.match?(/stream/i)
-          return send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
-        end
+      if tools&.any?
+        params[:tools] = tools.map { |t| MessageFormat::Responses.convert_tool_to_responses_format(t) }
+        params[:tool_choice] = "auto"
       end
 
-      raise_error(response) unless response.status == 200
-
-      # If non-streaming returned HTML (streaming-only server),
-      # fallback to streaming instead of getting stuck in a retry loop.
-      if html_response?(response)
-        return send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      begin
+        # When stream: true is configured (e.g. streaming-only proxies),
+        # skip the non-streaming create() attempt entirely.
+        if @stream
+          result = stream_responses_via_sdk(params)
+          result.is_a?(Hash) ? result : convert_sdk_response(result)
+        else
+          sdk_resp = @openai_sdk_client.responses.create(params)
+          convert_sdk_response(sdk_resp)
+        end
+      rescue OpenAI::Errors::BadRequestError => e
+        # Proxy requires streaming — fall back to SDK's stream_raw
+        if e.message.include?("stream") || e.message.include?("Stream")
+          result = stream_responses_via_sdk(params)
+          result.is_a?(Hash) ? result : convert_sdk_response(result)
+        else
+          raise map_sdk_error(e)
+        end
+      rescue OpenAI::Errors::APIStatusError => e
+        raise map_sdk_error(e)
       end
-
-      parsed_body = safe_json_parse(response.body, context: "LLM response")
-
-      # Track response ID and message count for next turn's delta.
-      # Only save previous_response_id when the upstream confirmed it works.
-      update_responses_state!(parsed_body, messages.size)
-
-      MessageFormat::Responses.parse_response(parsed_body)
     end
 
-    # Streaming variant of send_responses_request.  Reads the response body
-    # via Faraday's on_data callback, accumulates SSE chunks, and parses
-    # them into canonical format.
+    # Fallback for streaming-only proxies: use SDK's stream() to collect the
+    # full response, then extract the final Response object.
     #
-    # Graceful degradation: same previous_response_id fallback as the
-    # non-streaming path.
-    def send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
-      use_prev_id = @last_responses_id && @responses_supports_prev_id != false
-      new_messages = use_prev_id ? responses_delta_messages(messages) : messages
+    # Some proxies send `response.complete` instead of `response.completed`,
+    # which means SDK's ResponseStreamState never finalizes and get_final_response
+    # returns an empty output.  In that case, we manually accumulate the text
+    # and tool calls from the raw stream events.
+    private def stream_responses_via_sdk(params)
+      # Always use stream_raw directly — don't waste an API call on stream()
+      # + get_final_response first.  Some proxies send `response.complete`
+      # instead of `response.completed`, so SDK's ResponseStreamState never
+      # finalizes, making get_final_response always fail.  Using stream_raw
+      # avoids the extra (wasted) HTTP request.
+      content_parts = []
+      tool_calls    = []
+      usage_data    = nil
+      resp_id       = nil
 
-      body = MessageFormat::Responses.build_stream_request_body(
-        new_messages, model, tools, max_tokens, caching_enabled,
-        vision_supported: @vision_supported,
-        previous_response_id: use_prev_id ? @last_responses_id : nil
-      )
-      inject_cache_affinity!(body, :responses)
-
-      chunks = []
-      response = responses_connection.post("responses") do |req|
-        req.body = body.to_json
-        req.options.on_data = proc do |chunk, _bytes, _env|
-          chunks << chunk if chunk
+      raw_stream = @openai_sdk_client.responses.stream_raw(params)
+      raw_stream.each do |event|
+        case event.type
+        when :"response.output_text.delta"
+          content_parts << event.delta if event.delta
+        when :"response.output_text.done"
+          # Full text — authoritative, use this over accumulated deltas
+          content_parts.clear
+          content_parts << event.text if event.text
+        when :"response.output_item.done"
+          # The completed output item has all fields including call_id.
+          # Use this instead of function_call_arguments.done which lacks call_id.
+          item = event.item
+          if item.is_a?(OpenAI::Models::Responses::ResponseFunctionToolCall)
+            tool_calls << {
+              id:        item.call_id || item.id,
+              type:      "function",
+              name:      item.name,
+              arguments: item.arguments.to_s
+            }
+          end
+        when :"response.completed", :"response.complete"
+          # response.complete is a non-standard proxy variant
+          if event.respond_to?(:response) && event.response
+            resp_id = event.response.id if event.response.respond_to?(:id)
+            if event.response.respond_to?(:usage) && event.response.usage
+              usage_data = event.response.usage
+            end
+          end
         end
       end
 
-      # Handle previous_response_id rejection in streaming path too
-      if response.status == 400
-        error_body = begin
-          reconstructed = chunks.join
-          JSON.parse(reconstructed.empty? ? "{}" : reconstructed)
-        rescue
-          {}
-        end
-        error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+      build_canonical_from_stream(content_parts, tool_calls, usage_data, resp_id)
+    end
 
-        if error_msg.match?(/previous_response_id/i)
-          @responses_supports_prev_id = false
-          @last_responses_id = nil
-          @last_responses_message_count = 0
-          return send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
+    # Build the canonical response hash directly from accumulated stream data,
+    # bypassing convert_sdk_response (which requires SDK typed objects).
+    private def build_canonical_from_stream(content_parts, tool_calls, usage_data, resp_id)
+      content    = content_parts.empty? ? nil : content_parts.join
+      tool_calls = nil if tool_calls.empty?
+      finish_reason = tool_calls && !tool_calls.empty? ? "tool_calls" : "stop"
+
+      # Extract token counts — same logic as convert_sdk_response
+      raw_usage_h = usage_data&.deep_to_h || {}
+
+      prompt_tokens = usage_data&.input_tokens ||
+                      raw_usage_h[:prompt_tokens] ||
+                      raw_usage_h["prompt_tokens"].to_i
+      completion_tokens = usage_data&.output_tokens ||
+                          raw_usage_h[:completion_tokens] ||
+                          raw_usage_h["completion_tokens"].to_i
+      total_tokens = usage_data&.total_tokens ||
+                     raw_usage_h[:total_tokens] ||
+                     prompt_tokens.to_i + completion_tokens.to_i
+
+      cached_tokens = usage_data&.input_tokens_details&.cached_tokens ||
+                      raw_usage_h.dig(:input_tokens_details, :cached_tokens) ||
+                      raw_usage_h.dig(:prompt_tokens_details, :cached_tokens).to_i
+
+      usage = {
+        prompt_tokens:     prompt_tokens.to_i,
+        completion_tokens: completion_tokens.to_i,
+        total_tokens:      total_tokens.to_i
+      }
+      usage[:cache_read_input_tokens] = cached_tokens.to_i if cached_tokens.to_i > 0
+
+      raw_usage = {
+        input_tokens:  prompt_tokens.to_i,
+        output_tokens: completion_tokens.to_i,
+        total_tokens:  total_tokens.to_i
+      }
+      raw_usage.merge!(raw_usage_h)
+
+      {
+        id:               resp_id,
+        content:          content,
+        tool_calls:       tool_calls,
+        finish_reason:    finish_reason,
+        usage:            usage,
+        raw_api_usage:    raw_usage,
+        model:            nil,
+        response_object:  nil
+      }
+    end
+
+    # Convert an OpenAI::Responses::Response object to our canonical hash.
+    #
+    # SDK response shape:
+    #   response.output → [Message items, FunctionToolCall items, ...]
+    #   response.usage  → { input_tokens:, output_tokens:, total_tokens: }
+    #   response.id     → "resp_xxx"
+    private def convert_sdk_response(sdk_resp)
+      content_parts = []
+      tool_calls    = []
+      reasoning     = nil
+
+      sdk_resp.output.each do |item|
+        case item
+        when OpenAI::Models::Responses::ResponseOutputMessage
+          next unless item.role == :assistant
+
+          item.content.each do |part|
+            case part
+            when OpenAI::Models::Responses::ResponseOutputText
+              content_parts << part.text
+            end
+          end
+        when OpenAI::Models::Responses::ResponseFunctionToolCall
+          tool_calls << {
+            id:        item.call_id || item.id,
+            type:      "function",
+            name:      item.name,
+            arguments: item.arguments.to_s
+          }
+        when OpenAI::Models::Responses::ResponseReasoningItem
+          # Extract reasoning text if present
+          if item.respond_to?(:summary) && item.summary
+            reasoning = item.summary.map { |s| s.text if s.respond_to?(:text) }.compact.join("\n")
+          end
         end
       end
 
-      raise_error(response, chunks: chunks) unless response.status == 200
+      content    = content_parts.empty? ? nil : content_parts.join
+      tool_calls = nil if tool_calls.empty?
 
-      # HTML via stream — degrade to non-streaming (Responses stream path)
-      if html_data?(chunks.first.to_s.lstrip) || html_data?(response.body.to_s.lstrip)
-        raise StreamFallbackError, "Responses streaming returned HTML — falling back to non-streaming"
+      finish_reason = tool_calls && !tool_calls.empty? ? "tool_calls" : "stop"
+
+      usage_data = sdk_resp.usage
+
+      # Extract token counts from SDK's typed usage object.
+      # The SDK's ResponseUsage uses `input_tokens` / `output_tokens` (Responses
+      # API naming), but many proxies (OpenRouter, etc.) return Chat Completions
+      # format with `prompt_tokens` / `completion_tokens` instead.  When the SDK
+      # can't find the expected field it returns nil, so we fall back to the
+      # raw hash via `deep_to_h` which preserves ALL keys from the API response.
+      raw_usage_h = usage_data&.deep_to_h || {}
+
+      prompt_tokens = usage_data&.input_tokens ||
+                      raw_usage_h[:prompt_tokens] ||
+                      raw_usage_h["prompt_tokens"].to_i
+      completion_tokens = usage_data&.output_tokens ||
+                          raw_usage_h[:completion_tokens] ||
+                          raw_usage_h["completion_tokens"].to_i
+      total_tokens = usage_data&.total_tokens ||
+                     raw_usage_h[:total_tokens] ||
+                     prompt_tokens.to_i + completion_tokens.to_i
+
+      # Extract cache tokens from SDK's nested input_tokens_details.
+      # The Responses API reports cached_tokens inside input_tokens_details,
+      # which is the OpenAI equivalent of Anthropic's cache_read_input_tokens.
+      # Proxies may also send prompt_tokens_details.cached_tokens.
+      cached_tokens = usage_data&.input_tokens_details&.cached_tokens ||
+                      raw_usage_h.dig(:input_tokens_details, :cached_tokens) ||
+                      raw_usage_h.dig(:prompt_tokens_details, :cached_tokens).to_i
+
+      usage = {
+        prompt_tokens:     prompt_tokens.to_i,
+        completion_tokens: completion_tokens.to_i,
+        total_tokens:      total_tokens.to_i
+      }
+      usage[:cache_read_input_tokens] = cached_tokens.to_i if cached_tokens.to_i > 0
+
+      # Build raw_api_usage hash for track_cost / CostTracker compatibility.
+      # Uses symbol keys to match the convention from MessageFormat::OpenAI / Anthropic.
+      raw_usage = {
+        input_tokens:  prompt_tokens.to_i,
+        output_tokens: completion_tokens.to_i,
+        total_tokens:  total_tokens.to_i
+      }
+      if cached_tokens.to_i > 0
+        raw_usage[:input_tokens_details] = { cached_tokens: cached_tokens.to_i }
+        raw_usage[:cache_read_input_tokens] = cached_tokens.to_i
       end
 
-      result = MessageFormat::Responses.parse_stream_response(chunks)
-
-      # Track response ID from the final completed event for next turn's delta.
-      # The response ID is embedded in the response.completed SSE event; we
-      # extract it from the parsed usage data if present, or from the raw body.
-      resp_id = extract_responses_id_from_stream(chunks)
-      update_responses_state!(nil, messages.size, response_id: resp_id) if resp_id
-
+      result = {
+        content:       content,
+        tool_calls:    tool_calls,
+        finish_reason: finish_reason,
+        usage:         usage,
+        raw_api_usage: raw_usage
+      }
+      result[:reasoning_content] = reasoning if reasoning
       result
     end
 
-    # Parse a simple (non-tool) Responses API response into text.
-    def parse_simple_responses_response(response)
-      raise_error(response) unless response.status == 200
-      parsed_body = safe_json_parse(response.body, context: "LLM response")
-      output = parsed_body["output"] || []
-      output.select { |item| item["type"] == "message" }
-            .flat_map { |item| item["content"] || [] }
-            .select { |c| c["type"] == "output_text" }
-            .map { |c| c["text"] }
-            .join
-    end
+    # Extract plain text from an SDK Response object (for simple/non-tool calls).
+    # Extract text content from an SDK Response object or a canonical hash.
+    private def extract_response_text(sdk_resp)
+      # Canonical hash from build_canonical_from_stream
+      return sdk_resp[:content].to_s if sdk_resp.is_a?(Hash)
 
-    # Streaming variant of parse_simple_responses_response.  Returns accumulated text.
-    def parse_simple_responses_stream_response(model, input_items, max_tokens)
-      body = { model: model, max_output_tokens: max_tokens, store: false,
-               input: input_items, stream: true }
-      inject_cache_affinity!(body, :responses)
+      sdk_resp.output.filter_map do |item|
+        next unless item.is_a?(OpenAI::Models::Responses::ResponseOutputMessage) && item.role == :assistant
 
-      chunks = []
-      response = responses_connection.post("responses") do |req|
-        req.body = body.to_json
-        req.options.on_data = proc do |chunk, _bytes, _env|
-          chunks << chunk if chunk
-        end
-      end
-
-      raise_error(response, chunks: chunks) unless response.status == 200
-
-      # HTML via stream — degrade to non-streaming (simple Responses stream path)
-      if html_data?(chunks.first.to_s.lstrip) || html_data?(response.body.to_s.lstrip)
-        raise StreamFallbackError, "Responses streaming returned HTML — falling back to non-streaming"
-      end
-
-      parsed = MessageFormat::Responses.parse_stream_response(chunks)
-      parsed[:content] || ""
+        item.content.filter_map do |part|
+          part.text if part.is_a?(OpenAI::Models::Responses::ResponseOutputText)
+        end.join
+      end.join
     end
 
     # ── Prompt caching helpers ────────────────────────────────────────────────
@@ -975,6 +1086,66 @@ module Clacky
 
     def is_compression_instruction?(message)
       message.is_a?(Hash) && message[:system_injected] == true
+    end
+
+    # ── OpenAI SDK helpers ───────────────────────────────────────────────────
+
+    # Build an OpenAI::Client instance configured to talk to the user's
+    # chosen base_url with Kilo Code identity headers injected.
+    #
+    # The SDK uses net/http internally (with connection pooling via the
+    # connection_pool gem), so we don't need Faraday for this path.
+    private def build_openai_client
+      OpenAI::Client.new(
+        api_key: @api_key,
+        base_url: @base_url,
+        timeout: 300,
+        max_retries: 0   # we handle retries ourselves in llm_caller
+      )
+    end
+
+    # Map an OpenAI SDK error to our internal error classes so the retry
+    # and fallback logic in llm_caller continues to work unchanged.
+    #
+    # SDK error hierarchy:
+    #   OpenAI::Errors::APIStatusError
+    #     ├── APIConnectionError         → RetryableError (transient)
+    #     ├── BadRequestError (400)      → BadRequestError
+    #     ├── AuthenticationError (401)  → AgentError
+    #     ├── PermissionDeniedError (403)→ AgentError
+    #     ├── NotFoundError (404)        → AgentError
+    #     ├── ConflictError (409)        → RetryableError
+    #     ├── UnprocessableEntityError (422) → BadRequestError
+    #     ├── RateLimitError (429)       → RetryableError
+    #     ├── InternalServerError (500)  → RetryableError
+    private def map_sdk_error(error)
+      klass, msg = case error
+      when OpenAI::Errors::APIConnectionError
+        [RetryableError, "[LLM] Connection error: #{error.message}"]
+      when OpenAI::Errors::RateLimitError
+        [RetryableError, "[LLM] Rate limit exceeded, please wait a moment"]
+      when OpenAI::Errors::InternalServerError
+        [RetryableError, "[LLM] Service temporarily unavailable (#{error.status}), retrying..."]
+      when OpenAI::Errors::BadRequestError
+        [Clacky::BadRequestError, "[LLM] Client request error: #{error.message}"]
+      when OpenAI::Errors::AuthenticationError
+        [AgentError, "[LLM] Invalid API key"]
+      when OpenAI::Errors::PermissionDeniedError
+        [AgentError, "[LLM] Access denied: #{error.message}"]
+      when OpenAI::Errors::NotFoundError
+        [AgentError, "[LLM] API endpoint not found: #{error.message}"]
+      else
+        if error.status && error.status >= 500
+          [RetryableError, "[LLM] Service temporarily unavailable (#{error.status}), retrying..."]
+        elsif error.status && error.status == 429
+          [RetryableError, "[LLM] Rate limit exceeded, please wait a moment"]
+        elsif error.status && error.status == 402
+          [AgentError, "[LLM] Billing or payment issue: #{error.message}"]
+        else
+          [AgentError, "[LLM] API error (#{error.status}): #{error.message}"]
+        end
+      end
+      klass.new(msg)
     end
 
     # ── HTTP connections ──────────────────────────────────────────────────────
@@ -1034,70 +1205,12 @@ module Clacky
       end
     end
 
-    # Responses API connection shares the same auth and headers as Chat
-    # Completions (Bearer token, /v1 base) but POSTs to /v1/responses
-    # instead of /v1/chat/completions.
-    def responses_connection
-      @responses_connection ||= Faraday.new(url: @base_url) do |conn|
-        conn.headers["Content-Type"]  = "application/json"
-        conn.headers["Authorization"] = "Bearer #{@api_key}"
-        kilo_code_headers.each { |k, v| conn.headers[k] = v }
-        conn.options.timeout      = 300
-        conn.options.open_timeout = 10
-        conn.ssl.verify           = false
-        conn.adapter Faraday.default_adapter
-      end
-    end
-
-    # ── Responses API state tracking ───────────────────────────────────────────
-
-    # Return only the messages that are new since the last Responses API call.
-    # When @last_responses_id is set, the API already knows about all messages
-    # up to @last_responses_message_count (via previous_response_id).  Only
-    # send the tail — typically the latest tool results and any new user messages.
-    private def responses_delta_messages(messages)
-      return messages unless @last_responses_id
-
-      messages[@last_responses_message_count..] || []
-    end
-
-    # Update the Responses API tracking state after a successful response.
-    # Called from both the non-streaming (has parsed_body with "id") and
-    # streaming (has explicit response_id) paths.
-    private def update_responses_state!(parsed_body, message_count, response_id: nil)
-      @last_responses_message_count = message_count
-      @last_responses_id = response_id || parsed_body&.dig("id")
-    end
-
-    # Extract the response ID from a streaming Responses API response.
-    # The ID is in the response.completed SSE event's data.response.id field.
-    private def extract_responses_id_from_stream(chunks)
-      body = chunks.join
-      # Look for "id":"resp_xxx" in the response.completed event data
-      body.each_line do |line|
-        next unless line.start_with?("data: ")
-
-        data_str = line[6..]
-        next if data_str.strip == "[DONE]"
-
-        parsed = begin
-          JSON.parse(data_str)
-        rescue JSON::ParserError
-          nil
-        end
-        next unless parsed.is_a?(Hash)
-
-        resp = parsed["response"]
-        return resp["id"] if resp.is_a?(Hash) && resp["id"]
-      end
-      nil
-    end
-
     # Reset Responses API state — called when switching models or on error
     # that requires a fresh conversation start.
+    # NOTE: With the OpenAI SDK, state tracking is handled internally by the
+    # SDK's response objects. This method is kept as a no-op for compatibility.
     def reset_responses_state!
-      @last_responses_id = nil
-      @last_responses_message_count = 0
+      # no-op: SDK manages response state internally
     end
 
     def anthropic_connection

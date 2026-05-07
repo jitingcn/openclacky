@@ -43,6 +43,16 @@ module Clacky
 
       # ── Request building ──────────────────────────────────────────────────────
 
+      # Build input items from canonical messages for the Responses API.
+      # Used by the OpenAI SDK integration to construct the `input` parameter.
+      #
+      # @param messages [Array<Hash>] canonical messages
+      # @param vision_supported [Boolean] whether the target model accepts images
+      # @return [Array<Hash>] Responses API input items
+      def build_input_items(messages, vision_supported: true)
+        messages.flat_map { |msg| convert_message_to_input_items(msg, vision_supported: vision_supported) }
+      end
+
       # Build a Responses API request body.
       #
       # Converts canonical messages (Chat Completions format) into the
@@ -119,11 +129,16 @@ module Clacky
       # @param vision_supported [Boolean]
       # @param previous_response_id [String, nil]
       # @return [Array<Hash>]
-      private def convert_message_to_input_items(msg, vision_supported:, previous_response_id: nil)
-        case msg[:role]
+      private def convert_message_to_input_items(raw_msg, vision_supported:, previous_response_id: nil)
+        # Normalize to symbol keys for consistent access — callers may pass
+        # either string-keyed or symbol-keyed hashes.
+        msg = deep_symbolize_keys(raw_msg)
+        role = msg[:role]
+
+        case role
         when "system", "user"
           content = canonicalize_content(msg[:content], vision_supported: vision_supported)
-          [{ role: msg[:role], content: content }]
+          [{ role: role, content: content }]
 
         when "assistant"
           # When continuing via previous_response_id, the API already knows
@@ -177,7 +192,16 @@ module Clacky
 
         else
           # Unknown roles — pass through as-is
-          [msg]
+          [raw_msg]
+        end
+      end
+
+      # Recursively symbolize all keys in a Hash/Array structure.
+      private def deep_symbolize_keys(obj)
+        case obj
+        when Hash  then obj.each_with_object({}) { |(k, v), h| h[k.to_sym] = deep_symbolize_keys(v) }
+        when Array then obj.map { |item| deep_symbolize_keys(item) }
+        else obj
         end
       end
 
@@ -571,13 +595,17 @@ module Clacky
       # Convert a tool definition from Chat Completions format to Responses API format.
       # Chat Completions: { type: "function", function: { name:, description:, parameters: } }
       # Responses API:    { type: "function", name:, description:, parameters: }
-      private def convert_tool_to_responses_format(tool)
-        func = tool[:function] || tool
+      def convert_tool_to_responses_format(tool)
+        # Support both symbol and string keys
+        func = tool[:function] || tool["function"] || tool
+        func_name = func[:name] || func["name"] || tool[:name] || tool["name"]
+        func_desc = func[:description] || func["description"] || tool[:description] || tool["description"]
+        func_params = func[:parameters] || func["parameters"] || tool[:parameters] || tool["parameters"]
         {
           type: "function",
-          name: func[:name] || tool[:name],
-          description: func[:description] || tool[:description],
-          parameters: func[:parameters] || tool[:parameters]
+          name: func_name,
+          description: func_desc,
+          parameters: func_params
         }
       end
 
