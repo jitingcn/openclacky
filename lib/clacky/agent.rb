@@ -1197,7 +1197,9 @@ module Clacky
         subagent_config.api_key,
         base_url: subagent_config.base_url,
         model: subagent_config.model_name,
-        anthropic_format: subagent_config.anthropic_format?
+        anthropic_format: subagent_config.anthropic_format?,
+        api_type: subagent_config.api_type,
+        stream: subagent_config.stream
       )
 
       # Create subagent (reuses all tools from parent, inherits agent profile from parent)

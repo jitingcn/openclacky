@@ -139,6 +139,7 @@ module Clacky
   # otherwise unparseable). Subclass of RetryableError so it flows through the existing
   # retry/fallback pipeline in LlmCaller#call_llm.
   class UpstreamTruncatedError < RetryableError; end
+  class StreamFallbackError < StandardError; end  # Streaming returned HTML/bad response — degrade to non-streaming (NOT retried by call_llm)
   class ToolCallError < AgentError; end  # Raised when tool call fails due to invalid parameters
   class BrowserNotReachableError < AgentError; end  # Chrome/Edge not running or remote debugging disabled
   # BrowserManager singleton: Clacky::BrowserManager.instance

@@ -578,7 +578,18 @@ module Clacky
       end
 
       raise_error(response, chunks: chunks) unless response.status == 200
-      check_html_response(response, chunks: chunks)
+
+      # HTML response via stream means the endpoint doesn't support streaming
+      # (e.g. proxy returned an error page). Don't raise RetryableError here —
+      # let the caller's streaming-first fallback degrade to non-streaming
+      # instead of looping forever in call_llm's retry handler.
+      first_chunk = chunks.first.to_s.lstrip
+      if html_data?(first_chunk)
+        raise StreamFallbackError, "Anthropic streaming returned HTML — falling back to non-streaming"
+      end
+      if html_data?(response.body.to_s.lstrip)
+        raise StreamFallbackError, "Anthropic streaming returned HTML — falling back to non-streaming"
+      end
 
       MessageFormat::Anthropic.parse_stream_response(chunks)
     end
@@ -605,7 +616,13 @@ module Clacky
       end
 
       raise_error(response, chunks: chunks) unless response.status == 200
-      check_html_response(response, chunks: chunks)
+
+      # HTML via stream means endpoint doesn't support streaming — signal
+      # caller to degrade to non-streaming instead of triggering RetryableError.
+      first_chunk = chunks.first.to_s.lstrip
+      if html_data?(first_chunk) || html_data?(response.body.to_s.lstrip)
+        raise StreamFallbackError, "Anthropic streaming returned HTML — falling back to non-streaming"
+      end
 
       parsed = MessageFormat::Anthropic.parse_stream_response(chunks)
       parsed[:content] || ""
@@ -695,7 +712,11 @@ module Clacky
       end
 
       raise_error(response, chunks: chunks) unless response.status == 200
-      check_html_response(response, chunks: chunks)
+
+      # HTML via stream — degrade to non-streaming (OpenAI stream request path)
+      if html_data?(chunks.first.to_s.lstrip) || html_data?(response.body.to_s.lstrip)
+        raise StreamFallbackError, "OpenAI streaming returned HTML — falling back to non-streaming"
+      end
 
       MessageFormat::OpenAI.parse_stream_response(chunks)
     end
@@ -722,7 +743,11 @@ module Clacky
       end
 
       raise_error(response, chunks: chunks) unless response.status == 200
-      check_html_response(response, chunks: chunks)
+
+      # HTML via stream — degrade to non-streaming (simple OpenAI stream path)
+      if html_data?(chunks.first.to_s.lstrip) || html_data?(response.body.to_s.lstrip)
+        raise StreamFallbackError, "OpenAI streaming returned HTML — falling back to non-streaming"
+      end
 
       parsed = MessageFormat::OpenAI.parse_stream_response(chunks)
       parsed[:content] || ""
@@ -839,7 +864,11 @@ module Clacky
       end
 
       raise_error(response, chunks: chunks) unless response.status == 200
-      check_html_response(response, chunks: chunks)
+
+      # HTML via stream — degrade to non-streaming (Responses stream path)
+      if html_data?(chunks.first.to_s.lstrip) || html_data?(response.body.to_s.lstrip)
+        raise StreamFallbackError, "Responses streaming returned HTML — falling back to non-streaming"
+      end
 
       result = MessageFormat::Responses.parse_stream_response(chunks)
 
@@ -879,7 +908,11 @@ module Clacky
       end
 
       raise_error(response, chunks: chunks) unless response.status == 200
-      check_html_response(response, chunks: chunks)
+
+      # HTML via stream — degrade to non-streaming (simple Responses stream path)
+      if html_data?(chunks.first.to_s.lstrip) || html_data?(response.body.to_s.lstrip)
+        raise StreamFallbackError, "Responses streaming returned HTML — falling back to non-streaming"
+      end
 
       parsed = MessageFormat::Responses.parse_stream_response(chunks)
       parsed[:content] || ""
