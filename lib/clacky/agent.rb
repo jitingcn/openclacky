@@ -1578,16 +1578,31 @@ module Clacky
       ]
       return false if completion_patterns.any? { |p| text.match?(p) }
 
-      # Action-intent phrases — model says it WILL do something
+      # Action-intent detection: the model describes intent to perform a
+      # concrete action but didn't actually call any tools.
+      #
+      # Strategy: match action verbs (investigate, check, search, fix, etc.)
+      # combined with pronoun/modal context — "I'll investigate", "let me check",
+      # "我来排查", etc.  Pure factual statements without action verbs are
+      # treated as real answers, not stalled plans.
+      cn_verbs = "排查|检查|查看|看看|分析|搜索|查找|定位|修复|修改|创建|删除|读取|运行|执行|测试|验证|调试"
+      en_verbs = "investigate|check|look|search|find|fix|modify|create|delete|read|run|execute|test|verify|debug|analyz|explor|review|inspect|examin"
       action_patterns = [
-        /我来|我会|让我来|让我/,
-        /好的[，,]?\s*我/,
-        /了解[，,]?\s*我/,
-        /明白[，,]?\s*我/,
-        /\bI'll\b|\bI will\b|\blet me\b/i,
-        /\bI('m| am) going to\b/i,
-        /\bI need to\b|\bI should\b/i,
-        /\bLet's\b|\bWe('ll| will)\b/i
+        # Chinese: 我 + action verb (with optional modifier)
+        /我.{0,4}(#{cn_verbs})/,
+        # Chinese: modal + action verb without explicit "我"
+        /(先|需要|准备|打算|正在|开始).{0,3}(#{cn_verbs})/,
+        # Chinese: common intent phrases
+        /让我来|让我(直接)?|我来/,
+        # English: I + modal + action verb (flexible spacing)
+        /\bI\s*('ll|will|need to|should|can|have to|'m going to|plan to|want to)\b.{0,30}(#{en_verbs})/i,
+        # English: imperative intent (let me, let's, I'll start/begin)
+        /\blet me\b.{0,30}(#{en_verbs})/i,
+        /\blet's\b.{0,30}(#{en_verbs})/i,
+        /\bwe\s*('ll|should|need to|can)\b.{0,30}(#{en_verbs})/i,
+        /\bI'll (start|begin|go ahead)\b.{0,30}(#{en_verbs})/i,
+        # English: first-person present progressive intent
+        /\bI'm (going to|about to)\b.{0,30}(#{en_verbs})/i
       ]
       action_patterns.any? { |p| text.match?(p) }
     end
