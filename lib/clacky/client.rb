@@ -5,17 +5,44 @@ require "logger"
 
 require "faraday"
 require "json"
+require "digest"
+require "securerandom"
 
 module Clacky
   class Client
     MAX_RETRIES = 10
     RETRY_DELAY = 5 # seconds
 
+    # Stable identity for channel affinity — ensures the aggregation proxy
+    # routes requests from the same session to the same upstream, enabling
+    # prompt cache hits and better performance.
+    #
+    # Codex CLI sends  prompt_cache_key: "ses_xxx" (per-conversation)
+    # Claude Code sends metadata.user_id: hash(device_id + account_uuid + session_id)
+    #
+    # We generate both on first request per session and reuse them.
+    attr_reader :cache_affinity_session_id, :cache_affinity_device_id, :cache_affinity_user_id
+
     def initialize(api_key, base_url:, model:, anthropic_format: false, api_type: nil, stream: nil)
       @api_key = api_key
       @base_url = base_url
       @model = model
       @stream = stream  # true = always stream, false = never stream, nil = auto
+
+      # ── Cache affinity identity ──────────────────────────────────────────────
+      # Generate stable identifiers for proxy channel affinity.
+      # These mimic Codex CLI's prompt_cache_key and Claude Code's metadata.user_id.
+      #
+      # Claude Code (>= 2.1.78) sends metadata.user_id as a JSON string:
+      #   {"device_id":"sha256hex...","account_uuid":"","session_id":"..."}
+      # The proxy uses gjson:metadata.user_id for channel stickiness.
+      @cache_affinity_session_id = SecureRandom.hex(16)
+      @cache_affinity_device_id  = Digest::SHA256.hexdigest("claude_user_#{Digest::SHA256.hexdigest(api_key.to_s)[0, 16]}")
+      @cache_affinity_user_id    = JSON.generate({
+        device_id: @cache_affinity_device_id,
+        account_uuid: "",
+        session_id: @cache_affinity_session_id
+      })
 
       # Responses API state tracking for multi-turn conversation continuity.
       # The Responses API is stateful — it expects previous_response_id to chain
@@ -180,6 +207,7 @@ module Clacky
         parse_simple_bedrock_response(response)
       elsif anthropic_format?
         body     = MessageFormat::Anthropic.build_request_body(messages, model, [], max_tokens, false)
+        inject_cache_affinity!(body, :anthropic)
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
         # Fall back to Responses API when Anthropic endpoint requires streaming
         if response.status == 400
@@ -188,6 +216,7 @@ module Clacky
           if error_msg.match?(/stream/i)
             @use_responses = true
             body2 = { model: model, max_output_tokens: max_tokens, store: false, input: messages }
+            inject_cache_affinity!(body2, :responses)
             resp2 = responses_connection.post("responses") { |r| r.body = body2.to_json }
             return html_response?(resp2) ? parse_simple_responses_stream_response(model, messages, max_tokens) : parse_simple_responses_response(resp2)
           end
@@ -195,12 +224,14 @@ module Clacky
         if html_response?(response)
           @use_responses = true
           body2 = { model: model, max_output_tokens: max_tokens, store: false, input: messages }
+          inject_cache_affinity!(body2, :responses)
           resp2 = responses_connection.post("responses") { |r| r.body = body2.to_json }
           return html_response?(resp2) ? parse_simple_responses_stream_response(model, messages, max_tokens) : parse_simple_responses_response(resp2)
         end
         parse_simple_anthropic_response(response)
       elsif @use_responses
         body     = { model: model, max_output_tokens: max_tokens, store: false, input: messages }
+        inject_cache_affinity!(body, :responses)
         response = responses_connection.post("responses") { |r| r.body = body.to_json }
         if response.status == 400
           error_body = begin; JSON.parse(response.body); rescue; {}; end
@@ -214,6 +245,7 @@ module Clacky
         parse_simple_responses_response(response)
       else
         body = { model: model, max_tokens: max_tokens, messages: messages }
+        inject_cache_affinity!(body, :openai)
 
         # If user explicitly configured stream: true, skip the non-streaming
         # attempt entirely — go straight to streaming (saves 15s timeout wait).
@@ -328,6 +360,42 @@ module Clacky
       end
     end
 
+    # ── Cache affinity injection ───────────────────────────────────────────────
+    #
+    # Inject session identity fields into the request body so that aggregation
+    # proxies (e.g. new-api, one-api) can route requests from the same session
+    # to the same upstream channel.  Without these fields, the proxy randomly
+    # assigns upstreams, breaking prompt cache affinity.
+    #
+    # Codex CLI behavior (Responses API / Chat Completions):
+    #   - Body: { prompt_cache_key: "ses_xxx", ... }
+    #   - The proxy matches on gjson:prompt_cache_key to group requests
+    #
+    # Claude Code behavior (Anthropic Messages API):
+    #   - Body: { metadata: { user_id: "sha256hash..." }, ... }
+    #   - The proxy matches on gjson:metadata.user_id to group requests
+    #
+    # @param body [Hash] the request body hash (mutated in place)
+    # @param api_format [Symbol] :openai, :anthropic, :responses, or :bedrock
+    private def inject_cache_affinity!(body, api_format)
+      case api_format
+      when :responses, :openai
+        # Codex CLI sends prompt_cache_key as a stable session identifier.
+        # Aggregation proxies use this field (via gjson path) for channel
+        # affinity — all requests with the same key hit the same upstream.
+        body[:prompt_cache_key] = @cache_affinity_session_id
+      when :anthropic
+        # Claude Code (>= 2.1.78) sends metadata.user_id as a JSON-encoded
+        # string: {"device_id":"sha256...","account_uuid":"","session_id":"..."}
+        # Proxies match on gjson:metadata.user_id for stickiness.
+        body[:metadata] ||= {}
+        body[:metadata][:user_id] = @cache_affinity_user_id
+      when :bedrock
+        # Bedrock uses AWS session management — no injection needed
+      end
+      body
+    end
+
     # ── Prompt-caching support ────────────────────────────────────────────────
 
     # Returns true for Claude models that support prompt caching (gen 3.5+ or gen 4+).
@@ -380,6 +448,7 @@ module Clacky
       messages = apply_message_caching(messages) if caching_enabled
 
       body     = MessageFormat::Anthropic.build_request_body(messages, model, tools, max_tokens, caching_enabled)
+      inject_cache_affinity!(body, :anthropic)
       response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
 
       # Some providers require streaming even for Anthropic-format endpoints.
@@ -432,6 +501,7 @@ module Clacky
         messages, model, tools, max_tokens, caching_enabled,
         vision_supported: @vision_supported
       )
+      inject_cache_affinity!(body, :openai)
 
       # Try non-streaming first with a short timeout (15s).  Some providers
       # hang on non-streaming requests because they're streaming-only —
@@ -481,6 +551,7 @@ module Clacky
         messages, model, tools, max_tokens, caching_enabled,
         vision_supported: @vision_supported
       )
+      inject_cache_affinity!(body, :openai)
 
       chunks = []
       response = openai_connection.post("chat/completions") do |req|
@@ -507,6 +578,7 @@ module Clacky
     def parse_simple_openai_stream_response(model, messages, max_tokens)
       body = { model: model, max_tokens: max_tokens, messages: messages,
                stream: true, stream_options: { include_usage: true } }
+      inject_cache_affinity!(body, :openai)
 
       chunks = []
       response = openai_connection.post("chat/completions") do |req|
@@ -547,6 +619,7 @@ module Clacky
         vision_supported: @vision_supported,
         previous_response_id: use_prev_id ? @last_responses_id : nil
       )
+      inject_cache_affinity!(body, :responses)
       response = responses_connection.post("responses") { |r| r.body = body.to_json }
 
       # Handle errors that warrant a different request strategy
@@ -604,6 +677,7 @@ module Clacky
         vision_supported: @vision_supported,
         previous_response_id: use_prev_id ? @last_responses_id : nil
       )
+      inject_cache_affinity!(body, :responses)
 
       chunks = []
       response = responses_connection.post("responses") do |req|
@@ -661,6 +735,7 @@ module Clacky
     def parse_simple_responses_stream_response(model, input_items, max_tokens)
       body = { model: model, max_output_tokens: max_tokens, store: false,
                input: input_items, stream: true }
+      inject_cache_affinity!(body, :responses)
 
       chunks = []
       response = responses_connection.post("responses") do |req|
