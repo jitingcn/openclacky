@@ -151,7 +151,9 @@ module Clacky
         @config.api_key,
         base_url: @config.base_url,
         model: @config.model_name,
-        anthropic_format: @config.anthropic_format?
+        anthropic_format: @config.anthropic_format?,
+        api_type: @config.api_type,
+        stream: @config.stream
       )
       # Update message compressor with new client and model
       @message_compressor = MessageCompressor.new(@client, model: current_model)
@@ -358,6 +360,9 @@ module Clacky
         awaiting_user_feedback = false
         # Track if task was interrupted by user (denied tool execution)
         task_interrupted = false
+        # Track if we already performed an auto-retry for this task
+        # (model described action plan without tool calls on first iteration)
+        task_auto_retried = false
 
         loop do
           @iterations += 1
@@ -432,6 +437,20 @@ module Clacky
 
             # Show token usage after the assistant message so WebUI renders it below the bubble
             @ui&.show_token_usage(response[:token_usage]) if response[:token_usage]
+
+            # Auto-retry: some models (e.g. gpt-5.3-codex) occasionally describe an
+            # action plan on the first iteration without actually calling tools.
+            # When detected, inject a follow-up prompt and let the model try again.
+            # Only retry when the model returned text with NO tool calls at all.
+            if !task_auto_retried && @iterations == @task_start_iterations + 1 &&
+               (response[:tool_calls].nil? || response[:tool_calls].empty?) &&
+               response[:content] && !response[:content].empty? &&
+               action_plan_without_tools?(response[:content])
+              task_auto_retried = true
+              @ui&.show_info("Model described intent without tool calls — auto-continuing...")
+              @history.append({ role: "user", content: "Please use tools to accomplish this task now. Do not just describe what you will do — take action.", system_injected: true, task_id: task_id })
+              next
+            end
 
             # Debug: log why we're stopping
             if @config.verbose && (response[:tool_calls].nil? || response[:tool_calls].empty?)
@@ -768,6 +787,22 @@ module Clacky
       awaiting_feedback = false
 
       tool_calls.each_with_index do |call, index|
+        # Resolve tool name: handle case-insensitive and common alias mismatches
+        # from different LLM providers (e.g. "read" → "file_reader", "Read" → "file_reader")
+        original_name = call[:name]
+        resolved = @tool_registry.resolve(call[:name])
+        if resolved && resolved != call[:name]
+          @debug_logs << {
+            timestamp: Time.now.iso8601,
+            event: "tool_name_resolved",
+            original: original_name,
+            resolved: resolved
+          }
+          call = call.merge(name: resolved)
+        elsif resolved.nil?
+          # Tool truly not found — let the rescue below handle it with a clear message
+        end
+
         # Hook: before_tool_use
         hook_result = @hooks.trigger(:before_tool_use, call)
         if hook_result[:action] == :deny
@@ -1162,7 +1197,9 @@ module Clacky
         subagent_config.api_key,
         base_url: subagent_config.base_url,
         model: subagent_config.model_name,
-        anthropic_format: subagent_config.anthropic_format?
+        anthropic_format: subagent_config.anthropic_format?,
+        api_type: subagent_config.api_type,
+        stream: subagent_config.stream
       )
 
       # Create subagent (reuses all tools from parent, inherits agent profile from parent)
@@ -1512,6 +1549,56 @@ module Clacky
 
       parsed = parse_file_links(content)
       @ui&.show_assistant_message(parsed[:text], files: parsed[:files])
+    end
+
+    # Detect whether a model response describes an action plan without
+    # actually calling tools. Used for auto-retry when models like
+    # gpt-5.3-codex occasionally output "I'll do X" instead of doing X.
+    #
+    # Heuristic: the content starts with acknowledgment words and contains
+    # action-intent phrases, but lacks completion indicators (✅, "done", etc.).
+    private def action_plan_without_tools?(content)
+      text = content.to_s.strip
+      return false if text.empty? || text.length > 800  # Long responses are likely real answers
+
+      # Completion indicators — if present, this is a final answer, not a plan
+      completion_patterns = [
+        /✅|✔️|🎉|👍/,
+        /已完成|已修改|已提交|已保存|已创建|已删除/,
+        /done[.!]?|finished[.!]?|completed[.!]?/i,
+        /\btask (is )?(complete|done|finished)\b/i,
+        /(以上|上述|所有).*(完成|修改|更新)/,
+        /\bno changes?( needed| required)?\b/i
+      ]
+      return false if completion_patterns.any? { |p| text.match?(p) }
+
+      # Action-intent detection: the model describes intent to perform a
+      # concrete action but didn't actually call any tools.
+      #
+      # Strategy: match action verbs (investigate, check, search, fix, etc.)
+      # combined with pronoun/modal context — "I'll investigate", "let me check",
+      # "我来排查", etc.  Pure factual statements without action verbs are
+      # treated as real answers, not stalled plans.
+      cn_verbs = "排查|检查|查看|看看|分析|搜索|查找|定位|修复|修改|创建|删除|读取|运行|执行|测试|验证|调试"
+      en_verbs = "investigate|check|look|search|find|fix|modify|create|delete|read|run|execute|test|verify|debug|analyz|explor|review|inspect|examin"
+      action_patterns = [
+        # Chinese: 我 + action verb (with optional modifier)
+        /我.{0,4}(#{cn_verbs})/,
+        # Chinese: modal + action verb without explicit "我"
+        /(先|需要|准备|打算|正在|开始).{0,3}(#{cn_verbs})/,
+        # Chinese: common intent phrases
+        /让我来|让我(直接)?|我来/,
+        # English: I + modal + action verb (flexible spacing)
+        /\bI\s*('ll|will|need to|should|can|have to|'m going to|plan to|want to)\b.{0,30}(#{en_verbs})/i,
+        # English: imperative intent (let me, let's, I'll start/begin)
+        /\blet me\b.{0,30}(#{en_verbs})/i,
+        /\blet's\b.{0,30}(#{en_verbs})/i,
+        /\bwe\s*('ll|should|need to|can)\b.{0,30}(#{en_verbs})/i,
+        /\bI'll (start|begin|go ahead)\b.{0,30}(#{en_verbs})/i,
+        # English: first-person present progressive intent
+        /\bI'm (going to|about to)\b.{0,30}(#{en_verbs})/i
+      ]
+      action_patterns.any? { |p| text.match?(p) }
     end
 
     # Track modified files for Time Machine snapshots

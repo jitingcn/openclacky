@@ -2,12 +2,12 @@
 
 # Friendly Ruby version check — must come before anything else so it triggers
 # during `gem install` when the gemspec is evaluated.
-if RUBY_VERSION < "2.6.0"
+if RUBY_VERSION < "3.2.0"
   abort <<~MSG
 
     ✗  Ruby #{RUBY_VERSION} is not supported.
 
-    OpenClacky requires Ruby >= 2.6.0, but your system is running Ruby #{RUBY_VERSION}.
+    OpenClacky requires Ruby >= 3.2.0, but your system is running Ruby #{RUBY_VERSION}.
 
     ──────────────────────────────────────────────────────────────────────
      Recommended: Use the one-line installer (handles Ruby automatically)
@@ -36,7 +36,7 @@ Gem::Specification.new do |spec|
   spec.description = "OpenClacky is a Ruby CLI tool for interacting with AI models via OpenAI-compatible APIs. It provides chat functionality and autonomous AI agent capabilities with tool use."
   spec.homepage = "https://github.com/yafeilee/clacky"
   spec.license = "MIT"
-  spec.required_ruby_version = ">= 2.6.0"
+  spec.required_ruby_version = ">= 3.2.0"
 
   spec.metadata["homepage_uri"] = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/yafeilee/clacky"
@@ -56,8 +56,8 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
 
   # Runtime dependencies
-  # faraday >= 2.9 requires Ruby >= 3.0; cap at < 2.9 so Ruby 2.6 gets 2.8.x
-  spec.add_dependency "faraday", ">= 2.0", "< 2.9"
+  # faraday >= 2.9 requires Ruby >= 3.0; we require Ruby >= 3.2 so latest faraday 2.x works
+  spec.add_dependency "faraday", ">= 2.0"
   spec.add_dependency "faraday-multipart", "~> 1.0"
   spec.add_dependency "thor", "~> 1.3"
   spec.add_dependency "tty-prompt", "~> 0.23"
@@ -74,8 +74,11 @@ Gem::Specification.new do |spec|
   # rubyzip 3.x requires Ruby >= 3.0; pin to ~> 2.4.1 for cross-version compatibility
   spec.add_dependency "rubyzip", "~> 2.4.1"
 
-  # rouge >= 4.0 requires Ruby >= 2.7; cap at < 4.0 so Ruby 2.6 gets 3.30.0
-  spec.add_dependency "rouge", ">= 3.14", "< 4.0"
+  # Official OpenAI Ruby SDK — used for Responses API (POST /v1/responses)
+  spec.add_dependency "openai", "~> 0.61.0"
+
+  # rouge >= 4.0 requires Ruby >= 2.7; Ruby >= 3.2 so latest works
+  spec.add_dependency "rouge", ">= 3.14"
   spec.add_dependency "chunky_png", "~> 1.4"
 
   # For more information and examples about making a new gem, check out our

@@ -1522,6 +1522,7 @@ body {
   line-height: 1.6;
   word-break: break-word;
   position: relative;
+  white-space: pre-wrap;
 }
 
 .msg-time {
@@ -2979,6 +2980,59 @@ body {
 }
 .settings-error { color: var(--color-error); }
 
+/* ── Compression Settings ─────────────────────────────────────────── */
+.settings-compression {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-primary);
+  border-radius: 10px;
+}
+.settings-compression-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+/* Field rows: use model-field style (label on top, input full width) */
+.settings-compression-field {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.settings-compression-label {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.settings-compression-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-compression-input {
+  flex: 1;
+  padding: 7px 10px;
+  border: 1px solid var(--color-border-primary);
+  border-radius: 6px;
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-size: 13px;
+  text-align: left;
+  width: 100%;
+}
+.settings-compression-unit {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+}
+.settings-save-status {
+  font-size: 12px;
+  margin-left: 8px;
+}
+
 /* ── Browser toggle switch ───────────────────────────────────────────────── */
 .settings-browser-actions {
   display: flex;
@@ -3391,6 +3445,44 @@ body {
   display: flex;
   gap: 8px;
   align-items: center;
+}
+
+/* Per-model compression overrides (collapsible section inside model card) */
+.compression-overrides-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 0 4px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  transition: color .15s;
+}
+.compression-overrides-toggle:hover {
+  color: var(--color-text-primary);
+}
+.compression-overrides-arrow {
+  transition: transform .15s;
+  flex-shrink: 0;
+}
+.compression-overrides-hint {
+  font-weight: 400;
+  font-style: italic;
+  font-size: 11px;
+  opacity: 0.65;
+}
+.compression-overrides-body {
+  padding: 4px 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.model-field--compact {
+  gap: 4px;
 }
 
 /* ── Modals ──────────────────────────────────────────────────────────────── */

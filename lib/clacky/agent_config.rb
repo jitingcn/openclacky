@@ -154,7 +154,57 @@ module Clacky
     attr_accessor :permission_mode, :max_tokens, :verbose,
                   :enable_compression, :enable_prompt_caching,
                   :models, :current_model_index, :current_model_id,
-                  :memory_update_enabled, :skill_evolution
+                  :memory_update_enabled, :skill_evolution,
+                  :compression_token_threshold, :compression_message_threshold,
+                  :compression_max_recent_messages, :compression_target_tokens,
+                  :idle_compression_threshold, :idle_compression_delay
+
+    # Per-model compression override keys that can appear inside
+    # a model entry's "compression_overrides" hash.
+    PER_MODEL_COMPRESSION_KEYS = %w[
+      token_threshold message_threshold
+      max_recent_messages target_tokens
+      idle_threshold idle_delay
+    ].freeze
+
+    # Effective (per-model-aware) accessors for compression settings.
+    # Each method checks the current model's compression_overrides first;
+    # if an override exists it wins, otherwise the global default is used.
+    # This lets users tailor thresholds per model — e.g. DeepSeek with
+    # 500 k context can use a much higher token_threshold than GPT at 200 k.
+
+    def effective_compression_token_threshold
+      model_override(:token_threshold) || @compression_token_threshold
+    end
+
+    def effective_compression_message_threshold
+      model_override(:message_threshold) || @compression_message_threshold
+    end
+
+    def effective_compression_max_recent_messages
+      model_override(:max_recent_messages) || @compression_max_recent_messages
+    end
+
+    def effective_compression_target_tokens
+      model_override(:target_tokens) || @compression_target_tokens
+    end
+
+    def effective_idle_compression_threshold
+      model_override(:idle_threshold) || @idle_compression_threshold
+    end
+
+    def effective_idle_compression_delay
+      model_override(:idle_delay) || @idle_compression_delay
+    end
+
+    # Resolve a single compression override from the current model entry.
+    # Returns nil when the key is absent or the model has no overrides.
+    private def model_override(key)
+      overrides = current_model&.dig("compression_overrides")
+      return nil unless overrides.is_a?(Hash)
+      val = overrides[key.to_s]
+      val.nil? ? nil : val.to_i
+    end
 
     def initialize(options = {})
       @permission_mode = validate_permission_mode(options[:permission_mode])
@@ -182,6 +232,14 @@ module Clacky
       # models[current_model_index] only if no default marker exists.
       @current_model_id = options[:current_model_id] ||
                           (@models.find { |m| m["type"] == "default" } || @models[@current_model_index])&.dig("id")
+
+      # Compression thresholds (configurable)
+      @compression_token_threshold = options[:compression_token_threshold] || 150_000
+      @compression_message_threshold = options[:compression_message_threshold] || 200
+      @compression_max_recent_messages = options[:compression_max_recent_messages] || 20
+      @compression_target_tokens = options[:compression_target_tokens] || 10_000
+      @idle_compression_threshold = options[:idle_compression_threshold] || 20_000
+      @idle_compression_delay = options[:idle_compression_delay] || 180
 
       # Memory and skill evolution configuration
       @memory_update_enabled = options[:memory_update_enabled].nil? ? true : options[:memory_update_enabled]
@@ -369,6 +427,9 @@ module Clacky
     CONFIG_SETTINGS_KEYS = %w[
       enable_compression enable_prompt_caching memory_update_enabled
       skill_evolution
+      compression_token_threshold compression_message_threshold
+      compression_max_recent_messages compression_target_tokens
+      idle_compression_threshold idle_compression_delay
     ].freeze
 
     # Serialize the current agent configuration to YAML.
@@ -382,7 +443,13 @@ module Clacky
         "enable_compression" => @enable_compression,
         "enable_prompt_caching" => @enable_prompt_caching,
         "memory_update_enabled" => @memory_update_enabled,
-        "skill_evolution" => @skill_evolution
+        "skill_evolution" => @skill_evolution,
+        "compression_token_threshold" => @compression_token_threshold,
+        "compression_message_threshold" => @compression_message_threshold,
+        "compression_max_recent_messages" => @compression_max_recent_messages,
+        "compression_target_tokens" => @compression_target_tokens,
+        "idle_compression_threshold" => @idle_compression_threshold,
+        "idle_compression_delay" => @idle_compression_delay
       }
       YAML.dump("settings" => settings, "models" => persistable_models)
     end
@@ -421,6 +488,23 @@ module Clacky
       return false if index.nil?
 
       @current_model_id = id
+      @current_model_index = index
+
+      true
+    end
+
+    # Switch to a model by its display name (fuzzy match, case-insensitive).
+    #
+    # @param name [String] the model name to search for (e.g. "gpt-5.3-codex")
+    # @return [Boolean] true if switched, false if name not found
+    def switch_model_by_name(name)
+      return false if name.nil? || name.to_s.strip.empty?
+
+      name_str = name.to_s.strip.downcase
+      index = @models.find_index { |m| m["model"].to_s.downcase == name_str }
+      return false if index.nil?
+
+      @current_model_id = @models[index]["id"]
       @current_model_index = index
 
       true
@@ -531,16 +615,74 @@ module Clacky
       Clacky::MessageFormat::Bedrock.bedrock_api_key?(api_key.to_s, model_name.to_s)
     end
 
+    # Get API type override for current model.
+    # Valid values: "openai-completions", "openai-responses", "anthropic-messages", "bedrock", "" (auto-detect)
+    # Returns nil when not explicitly configured (falls back to provider auto-detection).
+    def api_type
+      val = current_model&.dig("api_type")
+      val.nil? || val.to_s.strip.empty? ? nil : val.to_s.strip
+    end
+
+    # Set API type for current model (overlay-aware; see #api_key=).
+    def api_type=(value)
+      return unless resolve_current_model_entry
+      if @virtual_model_overlay
+        @virtual_model_overlay["api_type"] = value
+      else
+        resolve_current_model_entry["api_type"] = value
+      end
+    end
+
+    # Get stream preference for current model.
+    # true = always use streaming, false = force non-streaming, nil = auto (try streaming first, fallback to non-stream)
+    def stream
+      current_model&.dig("stream")
+    end
+
+    # Get prompt caching support flag for current model.
+    # true = explicitly enabled, false = explicitly disabled, nil = auto-detect (fallback to format-based heuristic)
+    def prompt_caching
+      current_model&.dig("prompt_caching")
+    end
+
+    # Set prompt caching support flag for current model (overlay-aware; see #api_key=).
+    def prompt_caching=(value)
+      return unless resolve_current_model_entry
+      if @virtual_model_overlay
+        @virtual_model_overlay["prompt_caching"] = value
+      else
+        resolve_current_model_entry["prompt_caching"] = value
+      end
+    end
+
+    # Set stream preference for current model (overlay-aware; see #api_key=).
+    def stream=(value)
+      return unless resolve_current_model_entry
+      if @virtual_model_overlay
+        @virtual_model_overlay["stream"] = value
+      else
+        resolve_current_model_entry["stream"] = value
+      end
+    end
+
     # Add a new model configuration
-    def add_model(model:, api_key:, base_url:, anthropic_format: false, type: nil)
-      @models << {
+    def add_model(model:, api_key:, base_url:, anthropic_format: false, api_type: nil, stream: nil, prompt_caching: nil, type: nil, compression_overrides: nil)
+      entry = {
         "id" => SecureRandom.uuid,
         "api_key" => api_key,
         "base_url" => base_url,
         "model" => model,
         "anthropic_format" => anthropic_format,
+        "api_type" => api_type,
+        "stream" => stream,
+        "prompt_caching" => prompt_caching,
         "type" => type
       }.compact
+      # Per-model compression overrides (optional hash)
+      if compression_overrides.is_a?(Hash) && !compression_overrides.empty?
+        entry["compression_overrides"] = compression_overrides
+      end
+      @models << entry
     end
 
     # Find model by type (default or lite)

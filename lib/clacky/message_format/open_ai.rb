@@ -127,6 +127,163 @@ module Clacky
         end
       end
 
+      # Build a streaming request body (same as build_request_body but with
+      # stream: true + stream_options for usage).  Used when the provider
+      # rejects non-streaming requests (e.g. DeepSeek V4 requires streaming).
+      #
+      # @param messages [Array<Hash>] canonical messages
+      # @param model    [String]
+      # @param tools    [Array<Hash>] OpenAI-style tool definitions
+      # @param max_tokens [Integer]
+      # @param caching_enabled [Boolean]
+      # @param vision_supported [Boolean]
+      # @return [Hash]
+      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true)
+        body = build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: vision_supported)
+        body[:stream] = true
+        # Ask the API to include token usage in the final chunk (OpenAI >= 2024).
+        # Older proxies silently ignore unknown fields, so this is safe.
+        body[:stream_options] = { include_usage: true }
+        body
+      end
+
+      # Parse server-sent event (SSE) streaming chunks into canonical format.
+      #
+      # OpenAI streaming format (NDJSON over SSE):
+      #   data: {"choices":[{"delta":{"content":"..."}}]}
+      #   data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"..."}}]}}]}
+      #   data: {"choices":[{"finish_reason":"stop"}],"usage":{...}}
+      #   data: [DONE]
+      #
+      # Tool calls arrive as incremental fragments across multiple chunks;
+      # we accumulate by index and concatenate name/arguments.
+      #
+      # @param raw_chunks [Array<String>] raw response body chunks from Faraday on_data
+      # @return [Hash] canonical response: { content:, tool_calls:, finish_reason:, usage:, raw_api_usage: }
+      def parse_stream_response(raw_chunks)
+        body = raw_chunks.join
+        lines = body.split("\n")
+
+        content = +""
+        reasoning_content = +""
+        tool_calls_map = {}  # index => { id:, type:, name:, arguments: }
+        finish_reason = nil
+        usage_data = {}
+
+        idx = 0
+        while idx < lines.size
+          line = lines[idx]
+          idx += 1
+
+          next unless line.start_with?("data: ")
+
+          data_str = line[6..]  # strip "data: " prefix
+          next if data_str.strip == "[DONE]"
+
+          chunk = begin
+            JSON.parse(data_str)
+          rescue JSON::ParserError
+            # Faraday's on_data splits by network packet boundary, not by SSE
+            # line boundary. A single "data: {...}" line may be split across
+            # multiple chunks, producing incomplete JSON on the first line.
+            # Try merging subsequent lines until we get valid JSON.
+            merged = data_str
+            while idx < lines.size
+              next_line = lines[idx]
+              idx += 1
+              # Stop if we hit a new SSE event or DONE marker
+              break if next_line.start_with?("data: ") || next_line.strip.empty?
+              merged << next_line
+              begin
+                break chunk = JSON.parse(merged)
+              rescue JSON::ParserError
+                # Continue merging
+              end
+            end
+            # If we still can't parse, skip this fragment
+            next unless chunk.is_a?(Hash)
+            chunk
+          end
+
+          choice = chunk.dig("choices", 0)
+
+          # Usage arrives in the final chunk where choices is an empty array.
+          # Must extract usage BEFORE the "next unless choice" guard.
+          usage_data = chunk["usage"] if chunk["usage"].is_a?(Hash) && chunk["usage"]["prompt_tokens"]
+
+          next unless choice
+
+          delta = choice["delta"] || {}
+
+          # Accumulate text content
+          content << delta["content"] if delta["content"]
+
+          # Accumulate reasoning content (e.g. Kimi/Moonshot extended thinking)
+          reasoning_content << delta["reasoning_content"] if delta["reasoning_content"]
+
+          # Accumulate tool calls (arrive incrementally by index)
+          if delta["tool_calls"]
+            delta["tool_calls"].each do |tc|
+              tc_idx = tc["index"]
+              tool_calls_map[tc_idx] ||= { id: +"", type: "function", name: +"", arguments: +"" }
+              entry = tool_calls_map[tc_idx]
+              # id and name are complete values (sent once or repeated identically),
+              # NOT incrementally built like arguments — use = not <<.
+              # Using << would concatenate the same value across chunks,
+              # producing an illegally long call_id (900+ chars) on providers
+              # that repeat the id field in every streaming delta.
+              entry[:id]        = tc["id"]                       if tc["id"]
+              entry[:type]       = tc["type"] || "function"
+              entry[:name]      = tc.dig("function", "name")     if tc.dig("function", "name")
+              entry[:arguments] << tc.dig("function", "arguments") if tc.dig("function", "arguments")
+            end
+          end
+
+          # Track finish reason (appears in later chunks)
+          finish_reason = choice["finish_reason"] if choice["finish_reason"]
+
+          # Redundant usage extraction: some providers include usage in chunks
+          # that also have choices (not just the final empty-choices chunk).
+          usage_data = chunk["usage"] if chunk["usage"] && chunk["usage"]["prompt_tokens"]
+        end
+
+        # Build canonical tool_calls array sorted by index
+        tool_calls = tool_calls_map.keys.sort.map do |k|
+          tc = tool_calls_map[k]
+          # Convert the accumulated string buffers back to plain strings
+          { id: tc[:id].to_s, type: tc[:type], name: tc[:name].to_s, arguments: tc[:arguments].to_s }
+        end
+        tool_calls = nil if tool_calls.empty?
+
+        usage = {
+          prompt_tokens:     usage_data["prompt_tokens"],
+          completion_tokens: usage_data["completion_tokens"],
+          total_tokens:      usage_data["total_tokens"]
+        }
+        # Preserve extended usage fields when present
+        usage[:api_cost]                    = usage_data["cost"]                            if usage_data["cost"]
+        usage[:cache_creation_input_tokens] = usage_data["cache_creation_input_tokens"]     if usage_data["cache_creation_input_tokens"]
+        usage[:cache_read_input_tokens]     = usage_data["cache_read_input_tokens"]         if usage_data["cache_read_input_tokens"]
+        # OpenRouter stores cache info under prompt_tokens_details
+        if (details = usage_data["prompt_tokens_details"])
+          usage[:cache_read_input_tokens]     = details["cached_tokens"]    if details["cached_tokens"].to_i > 0
+          usage[:cache_creation_input_tokens] = details["cache_write_tokens"] if details["cache_write_tokens"].to_i > 0
+        end
+
+        result = {
+          content:       content.empty? ? nil : content,
+          tool_calls:    tool_calls,
+          finish_reason: finish_reason,
+          usage:         usage,
+          raw_api_usage: usage_data
+        }
+
+        # Preserve reasoning_content (e.g. Kimi/Moonshot extended thinking)
+        result[:reasoning_content] = reasoning_content unless reasoning_content.empty?
+
+        result
+      end
+
       # ── Response parsing ──────────────────────────────────────────────────────
 
       # Parse OpenAI-compatible API response into canonical internal format.

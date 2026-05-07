@@ -95,7 +95,8 @@ module Clacky
             model: current_model,
             tools: tools_to_send,
             max_tokens: @config.max_tokens,
-            enable_caching: @config.enable_prompt_caching
+            enable_caching: @config.enable_prompt_caching,
+            prompt_caching: @config.prompt_caching
           )
 
           # Successful response — if we were probing, confirm primary is healthy.

@@ -11,19 +11,22 @@ module Clacky
   #     # called on the compression thread after compression finishes
   #     broadcast_update if success
   #   end
-  #   timer.start   # call after each agent run completes
+  #   timer.start   # call after each agent run completes (waits @idle_delay sec)
   #   timer.cancel  # call when new user input arrives
   class IdleCompressionTimer
-    # Seconds of inactivity before idle compression is triggered
-    IDLE_DELAY = 180
+    # Seconds of inactivity before idle compression is triggered.
+    # Default is 180; can be overridden via the idle_delay: parameter.
+    DEFAULT_IDLE_DELAY = 180
 
     # @param agent [Clacky::Agent] the agent whose messages will be compressed
     # @param session_manager [Clacky::SessionManager, nil] used to persist session after compression
+    # @param idle_delay [Integer] seconds of inactivity before idle compression triggers (default: 180)
     # @param logger [#call, nil] optional logger lambda: ->(msg, level:) { ... }
     # @param on_compress [Proc, nil] block called after compression attempt with success (bool)
-    def initialize(agent:, session_manager: nil, logger: nil, &on_compress)
+    def initialize(agent:, session_manager: nil, idle_delay: 180, logger: nil, &on_compress)
       @agent           = agent
       @session_manager = session_manager
+      @idle_delay      = idle_delay
       @logger          = logger
       @on_compress     = on_compress
 
@@ -39,7 +42,7 @@ module Clacky
 
       @timer_thread = Thread.new do
         Thread.current.name = "idle-compression-timer"
-        sleep IDLE_DELAY
+        sleep @idle_delay
 
         # Register @compress_thread inside the mutex BEFORE the thread starts running,
         # so cancel() can always find and interrupt it even if it fires immediately.

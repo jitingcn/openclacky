@@ -99,7 +99,7 @@ RSpec.describe "Agent file processing" do
         )
         allow(Clacky::Utils::FileProcessor).to receive(:process_path).and_return(ref)
 
-        stub_llm_reply("I'll fix the parser")
+        stub_llm_reply("Processing the file...")
         agent.run("read this pdf", files: [{ name: "bad.pdf", path: path }])
 
         injected = agent.history.to_a.select { |e| e[:system_injected] }.last
