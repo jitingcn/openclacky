@@ -605,8 +605,14 @@ module Clacky
       end
     end
 
-    # Check if should use Anthropic format for current model
+    # Check whether the current model should use the Anthropic Messages format.
+    # Explicit api_type wins over the legacy anthropic_format flag so every
+    # caller sees the effective routing choice, not just the stored fallback.
     def anthropic_format?
+      explicit_api_type = api_type
+      return true if explicit_api_type == "anthropic-messages"
+      return false if explicit_api_type
+
       current_model&.dig("anthropic_format") || false
     end
 

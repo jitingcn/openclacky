@@ -506,6 +506,46 @@ RSpec.describe Clacky::Server::HttpServer do
           expect(agent.current_model_info[:model]).to eq("abs-claude-sonnet-4-5")
         end
       end
+
+      it "propagates explicit api_type and stream to the created session client" do
+        glm_config = Clacky::AgentConfig.new(models: [
+          {
+            "model"            => "abs-claude-sonnet-4-5",
+            "api_key"          => "clacky-aaaaaaaaaaaa1111",
+            "base_url"         => "https://api.openclacky.com",
+            "anthropic_format" => true,
+            "type"             => "default"
+          },
+          {
+            "model"            => "glm-5.1",
+            "api_key"          => "z-ai-test-key",
+            "base_url"         => "https://open.bigmodel.cn/api/paas/v4",
+            "anthropic_format" => false,
+            "api_type"         => "anthropic-messages",
+            "stream"           => false
+          }
+        ])
+
+        with_server(agent_config: glm_config) do |server|
+          target = glm_config.models.find { |m| m["model"] == "glm-5.1" }
+
+          req = fake_req(method: "POST", path: "/api/sessions",
+                         body: { name: "glm-s", model_id: target["id"] })
+          res = fake_res
+          dispatch(server, req, res)
+
+          expect(res.status).to eq(201)
+          session_id = parsed_body(res)["session"]["id"]
+
+          registry = server.instance_variable_get(:@registry)
+          agent = nil
+          registry.with_session(session_id) { |s| agent = s[:agent] }
+
+          client = agent.instance_variable_get(:@client)
+          expect(client.anthropic_format?).to eq(true)
+          expect(client.instance_variable_get(:@stream)).to eq(false)
+        end
+      end
     end
   end
 

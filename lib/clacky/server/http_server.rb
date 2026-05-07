@@ -3026,7 +3026,9 @@ module Clacky
           model_cfg["api_key"].to_s,
           base_url:         model_cfg["base_url"].to_s,
           model:            model_name,
-          anthropic_format: model_cfg["anthropic_format"] || false
+          anthropic_format: model_cfg["anthropic_format"] || false,
+          api_type:         model_cfg["api_type"],
+          stream:           model_cfg.key?("stream") ? model_cfg["stream"] : nil
         )
 
         # Override Faraday timeouts via a short-lived env var isn't ideal;
@@ -3632,7 +3634,9 @@ module Clacky
           config.api_key,
           base_url: config.base_url,
           model: config.model_name,
-          anthropic_format: config.anthropic_format?
+          anthropic_format: config.anthropic_format?,
+          api_type: config.api_type,
+          stream: config.stream
         )
 
         broadcaster = method(:broadcast)
