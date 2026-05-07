@@ -592,6 +592,22 @@ module Clacky
       current_model&.dig("stream")
     end
 
+    # Get prompt caching support flag for current model.
+    # true = explicitly enabled, false = explicitly disabled, nil = auto-detect (fallback to format-based heuristic)
+    def prompt_caching
+      current_model&.dig("prompt_caching")
+    end
+
+    # Set prompt caching support flag for current model (overlay-aware; see #api_key=).
+    def prompt_caching=(value)
+      return unless resolve_current_model_entry
+      if @virtual_model_overlay
+        @virtual_model_overlay["prompt_caching"] = value
+      else
+        resolve_current_model_entry["prompt_caching"] = value
+      end
+    end
+
     # Set stream preference for current model (overlay-aware; see #api_key=).
     def stream=(value)
       return unless resolve_current_model_entry
@@ -603,7 +619,7 @@ module Clacky
     end
 
     # Add a new model configuration
-    def add_model(model:, api_key:, base_url:, anthropic_format: false, api_type: nil, stream: nil, type: nil)
+    def add_model(model:, api_key:, base_url:, anthropic_format: false, api_type: nil, stream: nil, prompt_caching: nil, type: nil)
       @models << {
         "id" => SecureRandom.uuid,
         "api_key" => api_key,
@@ -612,6 +628,7 @@ module Clacky
         "anthropic_format" => anthropic_format,
         "api_type" => api_type,
         "stream" => stream,
+        "prompt_caching" => prompt_caching,
         "type" => type
       }.compact
     end

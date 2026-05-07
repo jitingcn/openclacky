@@ -2673,6 +2673,7 @@ module Clacky
             anthropic_format: m["anthropic_format"] || false,
             api_type:         m["api_type"],
             stream:           m.key?("stream") ? m["stream"] : nil,
+            prompt_caching:   m.key?("prompt_caching") ? m["prompt_caching"] : nil,
             type:             m["type"]
           }
         end
@@ -2783,7 +2784,8 @@ module Clacky
           "api_key"          => api_key,
           "anthropic_format" => body["anthropic_format"] || false,
           "api_type"         => body["api_type"],
-          "stream"           => body.key?("stream") ? body["stream"] : nil
+          "stream"           => body.key?("stream") ? body["stream"] : nil,
+          "prompt_caching"   => body.key?("prompt_caching") ? body["prompt_caching"] : nil
         }.compact
         type = body["type"].to_s
         unless type.empty?
@@ -2852,6 +2854,10 @@ module Clacky
         # stream: true (always streaming), false (never streaming), null (auto — try streaming first)
         if body.key?("stream")
           target["stream"] = body["stream"]
+        end
+        # prompt_caching: true (enabled), false (disabled), null (auto — detect by format)
+        if body.key?("prompt_caching")
+          target["prompt_caching"] = body["prompt_caching"]
         end
         if body.key?("api_key")
           new_key = body["api_key"].to_s

@@ -92,49 +92,37 @@ RSpec.describe "Prompt Caching Feature" do
     let(:api_key) { "test-key" }
     let(:base_url) { "https://api.example.com" }
     let(:client) { Clacky::Client.new(api_key, base_url: base_url, model: "claude-3.5-sonnet-20241022") }
-    
+
     describe "#supports_prompt_caching?" do
-      it "returns true for Claude 3.5 Sonnet models" do
-        expect(client.send(:supports_prompt_caching?, "claude-3.5-sonnet-20241022")).to be true
-        expect(client.send(:supports_prompt_caching?, "claude-3.5-sonnet-latest")).to be true
-      end
-      
-      it "returns true for Claude 3.7 models" do
-        expect(client.send(:supports_prompt_caching?, "claude-3-7-sonnet")).to be true
-      end
-      
-      it "returns true for Claude 4 models" do
-        expect(client.send(:supports_prompt_caching?, "claude-4-opus")).to be true
-        expect(client.send(:supports_prompt_caching?, "claude-opus-4-6")).to be true
-        expect(client.send(:supports_prompt_caching?, "claude-sonnet-4-6")).to be true
-        expect(client.send(:supports_prompt_caching?, "claude-haiku-4-5")).to be true
-      end
-      
-      it "returns false for older Claude models" do
-        expect(client.send(:supports_prompt_caching?, "claude-3-opus-20240229")).to be false
-        expect(client.send(:supports_prompt_caching?, "claude-2.1")).to be false
-      end
-      
-      it "returns false for non-Claude models" do
-        expect(client.send(:supports_prompt_caching?, "gpt-4")).to be false
-        expect(client.send(:supports_prompt_caching?, "gpt-3.5-turbo")).to be false
-        expect(client.send(:supports_prompt_caching?, "MiniMax-M2.7")).to be false
-        expect(client.send(:supports_prompt_caching?, "kimi-k2.5")).to be false
-        expect(client.send(:supports_prompt_caching?, "mimo-v2-pro")).to be false
+      context "with explicit per-model flag" do
+        let(:client) { Clacky::Client.new(api_key, base_url: base_url, model: "gpt-4") }
+
+        it "returns true when prompt_caching is explicitly set to true" do
+          expect(client.send(:supports_prompt_caching?, "gpt-4", true)).to be true
+        end
+
+        it "returns false when prompt_caching is explicitly set to false" do
+          expect(client.send(:supports_prompt_caching?, "claude-3.5-sonnet-20241022", false)).to be false
+        end
       end
 
-      it "returns false for old Claude 3.0 models" do
-        expect(client.send(:supports_prompt_caching?, "claude-3-opus-20240229")).to be false
-        expect(client.send(:supports_prompt_caching?, "claude-2.1")).to be false
-      end
+      context "without explicit flag (fallback to format)" do
+        it "returns true for anthropic-messages format clients" do
+          client = Clacky::Client.new(api_key, base_url: base_url, model: "glm-5.1", api_type: "anthropic-messages")
+          expect(client.send(:supports_prompt_caching?, "glm-5.1")).to be true
+        end
 
-      it "returns true for Clacky AI Bedrock proxy models with abs- prefix" do
-        expect(client.send(:supports_prompt_caching?, "abs-claude-haiku-4-5")).to be true
-        expect(client.send(:supports_prompt_caching?, "abs-claude-sonnet-4-6")).to be true
-        expect(client.send(:supports_prompt_caching?, "abs-claude-opus-4-6")).to be true
+        it "returns false for OpenAI Chat Completions format clients" do
+          client = Clacky::Client.new(api_key, base_url: base_url, model: "deepseek-v4-pro")
+          expect(client.send(:supports_prompt_caching?, "deepseek-v4-pro")).to be false
+        end
+
+        it "returns false for default (no api_type) clients" do
+          client = Clacky::Client.new(api_key, base_url: base_url, model: "claude-3.5-sonnet-20241022")
+          expect(client.send(:supports_prompt_caching?, "claude-3.5-sonnet-20241022")).to be false
+        end
       end
-    end
-    
+    end    
     describe "#deep_clone" do
       it "deep clones hashes" do
         original = { a: { b: { c: 1 } } }

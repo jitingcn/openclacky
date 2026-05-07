@@ -345,8 +345,8 @@ module Clacky
     #   signal metric — see docs).  When we add full streaming support (with
     #   incremental UI), this same `ttft_ms` field will start carrying the
     #   *actual* first-token latency without any schema change.
-    def send_messages_with_tools(messages, model:, tools:, max_tokens:, enable_caching: false)
-      caching_enabled = enable_caching && supports_prompt_caching?(model)
+    def send_messages_with_tools(messages, model:, tools:, max_tokens:, enable_caching: false, prompt_caching: nil)
+      caching_enabled = enable_caching && supports_prompt_caching?(model, prompt_caching)
       cloned = deep_clone(messages)
 
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -425,14 +425,14 @@ module Clacky
     #   - MiMo has no documented caching API
     #   - Only Claude (direct, OpenRouter, or ClackyAI Bedrock proxy) consumes our
     #     cache_control / cachePoint markers
-    def supports_prompt_caching?(model)
-      # Strip ClackyAI Bedrock proxy prefix before matching
-      model_str = model.to_s.downcase.sub(/^abs-/, "")
-      return false unless model_str.include?("claude")
+    def supports_prompt_caching?(_model, explicit_flag = nil)
+      # 1) Per-model explicit config wins (true/false in config.yml)
+      return explicit_flag unless explicit_flag.nil?
 
-      # Match Claude gen 3.5+ (3.5/3.6/3.7…) or gen 4+ in any name format:
-      #   claude-3.5-sonnet-...  claude-3-7-sonnet  claude-haiku-4-5  claude-sonnet-4-6
-      model_str.match?(/claude(?:-3[-.]?[5-9]|.*-[4-9][-.]|.*-[4-9]$|-[4-9][-.]|-[4-9]$|-sonnet-[34])/)
+      # 2) Fallback: Anthropic Messages API supports cache_control as a standard
+      #    protocol feature; OpenAI Chat Completions only supports it for
+      #    specific backends (OpenRouter → Anthropic passthrough).
+      @use_anthropic_format
     end
 
 
