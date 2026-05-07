@@ -822,10 +822,38 @@ module Clacky
       end
     end
 
+    # Kilo Code client identity constants for aggregation proxy channel affinity.
+    # Kilo Code's DEFAULT_HEADERS (from @/kilocode/const.ts):
+    #   HTTP-Referer: https://kilocode.ai
+    #   X-Title: Kilo Code
+    #   User-Agent: Kilo-Code/{version}
+    #
+    # The AI SDK appends its own suffix to the User-Agent at request time via
+    # withUserAgentSuffix(), producing:
+    #   Kilo-Code/7.2.42 ai-sdk/provider-utils/4.0.23 runtime/node.js/v22.11.0
+    KILO_CODE_VERSION = "7.2.42"
+    AI_SDK_PROVIDER_UTILS_VERSION = "4.0.23"
+    AI_SDK_PROVIDER_UA = "ai-sdk/provider-utils/#{AI_SDK_PROVIDER_UTILS_VERSION}".freeze
+    NODE_RUNTIME_UA = "runtime/node.js/v22.11.0"
+    KILO_CODE_UA = "Kilo-Code/#{KILO_CODE_VERSION} #{AI_SDK_PROVIDER_UA} #{NODE_RUNTIME_UA}".freeze
+    private_constant :AI_SDK_PROVIDER_UA, :AI_SDK_PROVIDER_UTILS_VERSION, :NODE_RUNTIME_UA
+
+    # Shared Kilo Code client identity headers applied to OpenAI and Responses
+    # connections.  These mimic what a real Kilo Code CLI sends, helping
+    # aggregation proxies identify and route our requests.
+    def kilo_code_headers
+      {
+        "HTTP-Referer" => "https://kilocode.ai",
+        "X-Title"      => "Kilo Code",
+        "User-Agent"   => KILO_CODE_UA
+      }
+    end
+
     def openai_connection
       @openai_connection ||= Faraday.new(url: @base_url) do |conn|
         conn.headers["Content-Type"]  = "application/json"
         conn.headers["Authorization"] = "Bearer #{@api_key}"
+        kilo_code_headers.each { |k, v| conn.headers[k] = v }
         conn.options.timeout      = 300
         conn.options.open_timeout = 10
         conn.ssl.verify           = false
@@ -840,6 +868,7 @@ module Clacky
       @responses_connection ||= Faraday.new(url: @base_url) do |conn|
         conn.headers["Content-Type"]  = "application/json"
         conn.headers["Authorization"] = "Bearer #{@api_key}"
+        kilo_code_headers.each { |k, v| conn.headers[k] = v }
         conn.options.timeout      = 300
         conn.options.open_timeout = 10
         conn.ssl.verify           = false
