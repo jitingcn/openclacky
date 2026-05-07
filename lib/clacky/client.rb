@@ -550,6 +550,9 @@ module Clacky
     # via Faraday's on_data callback, accumulates Anthropic SSE chunks, and
     # parses them into canonical format.
     def send_anthropic_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      # Apply cache_control to the message that marks the cache breakpoint
+      messages = apply_message_caching(messages) if caching_enabled
+
       body = MessageFormat::Anthropic.build_stream_request_body(messages, model, tools, max_tokens, caching_enabled)
       inject_cache_affinity!(body, :anthropic)
 
@@ -697,6 +700,10 @@ module Clacky
     # on_data callback, accumulates SSE chunks, and parses them into the same
     # canonical format as the non-streaming path.
     def send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      # Apply cache_control markers to messages when caching is enabled.
+      # OpenRouter proxies Claude with the same cache_control field convention as Anthropic direct.
+      messages = apply_message_caching(messages) if caching_enabled
+
       body = MessageFormat::OpenAI.build_stream_request_body(
         messages, model, tools, max_tokens, caching_enabled,
         vision_supported: @vision_supported
