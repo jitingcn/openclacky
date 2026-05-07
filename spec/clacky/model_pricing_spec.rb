@@ -343,94 +343,7 @@ RSpec.describe Clacky::ModelPricing do
         expect(result[:source]).to eq(:price)
       end
 
-      it "calculates glm-4.6 basic cost (same tier as glm-4.7)" do
-        usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
 
-        # Same pricing as glm-4.7
-        result = described_class.calculate_cost(model: "glm-4.6", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(0.17)
-        expect(result[:source]).to eq(:price)
-      end
-
-      it "calculates glm-4.5 basic cost (same tier as glm-4.7)" do
-        usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
-
-        # Same pricing as glm-4.7
-        result = described_class.calculate_cost(model: "glm-4.5", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(0.17)
-        expect(result[:source]).to eq(:price)
-      end
-
-      it "calculates glm-4.5-x high-performance cost" do
-        usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
-
-        # Input:  (100_000 / 1_000_000) * $2.20 = $0.22
-        # Output: (50_000  / 1_000_000) * $8.90 = $0.445
-        # Total: $0.665
-        result = described_class.calculate_cost(model: "glm-4.5-x", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(0.665)
-        expect(result[:source]).to eq(:price)
-      end
-
-      it "calculates glm-4.5-air budget cost" do
-        usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
-
-        # Input:  (100_000 / 1_000_000) * $0.20 = $0.02
-        # Output: (50_000  / 1_000_000) * $1.10 = $0.055
-        # Total: $0.075
-        result = described_class.calculate_cost(model: "glm-4.5-air", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(0.075)
-        expect(result[:source]).to eq(:price)
-      end
-
-      it "calculates glm-4.5-airx fast budget cost" do
-        usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
-
-        # Input:  (100_000 / 1_000_000) * $1.10 = $0.11
-        # Output: (50_000  / 1_000_000) * $4.50 = $0.225
-        # Total: $0.335
-        result = described_class.calculate_cost(model: "glm-4.5-airx", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(0.335)
-        expect(result[:source]).to eq(:price)
-      end
-
-      it "calculates glm-4-32b flat-rate cost" do
-        usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
-
-        # Input:  (100_000 / 1_000_000) * $0.10 = $0.01
-        # Output: (50_000  / 1_000_000) * $0.10 = $0.005
-        # Total: $0.015
-        result = described_class.calculate_cost(model: "glm-4-32b", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(0.015)
-        expect(result[:source]).to eq(:price)
-      end
-
-      it "calculates glm-4.7-flashx ultra-budget cost" do
-        usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
-
-        # Input:  (100_000 / 1_000_000) * $0.07 = $0.007
-        # Output: (50_000  / 1_000_000) * $0.40 = $0.02
-        # Total: $0.027
-        result = described_class.calculate_cost(model: "glm-4.7-flashx", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(0.027)
-        expect(result[:source]).to eq(:price)
-      end
-
-      it "calculates glm-4.7-flash as free" do
-        usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
-
-        result = described_class.calculate_cost(model: "glm-4.7-flash", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(0.0)
-        expect(result[:source]).to eq(:price)
-      end
-
-      it "calculates glm-4.5-flash as free" do
-        usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
-
-        result = described_class.calculate_cost(model: "glm-4.5-flash", usage: usage)
-        expect(result[:cost]).to be_within(0.0001).of(0.0)
-        expect(result[:source]).to eq(:price)
-      end
 
       it "matches GLM model names case-insensitively" do
         usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
@@ -441,7 +354,7 @@ RSpec.describe Clacky::ModelPricing do
 
       it "does not match unregistered GLM variants" do
         usage = { prompt_tokens: 100_000, completion_tokens: 50_000 }
-        %w[glm-5v-turbo glm-4-plus glm-4-long glm-4v].each do |model|
+        %w[glm-4-plus glm-4-long glm-4v glm-4.5 glm-4.6].each do |model|
           result = described_class.calculate_cost(model: model, usage: usage)
           expect(result[:cost]).to be_nil
           expect(result[:source]).to be_nil
