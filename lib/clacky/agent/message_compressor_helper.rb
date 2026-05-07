@@ -6,9 +6,9 @@ module Clacky
     # Handles automatic compression when token limits are exceeded
     module MessageCompressorHelper
       # Compression thresholds are now configurable via AgentConfig.
-      # See @config.compression_token_threshold, @config.compression_message_threshold,
-      # @config.compression_max_recent_messages, @config.compression_target_tokens,
-      # @config.idle_compression_threshold.
+      # Per-model overrides are supported — the effective_* accessors on @config
+      # resolve model-level compression_overrides first, falling back to the
+      # global default. See AgentConfig#effective_compression_token_threshold etc.
 
       # Trigger compression during idle time (user-friendly, interruptible)
       # Returns true if compression was performed, false otherwise
@@ -22,8 +22,8 @@ module Clacky
             enable_compression: @config.enable_compression,
             previous_total_tokens: @previous_total_tokens,
             history_size: @history.size,
-            idle_threshold: @config.idle_compression_threshold,
-            max_recent_messages: @config.compression_max_recent_messages
+            idle_threshold: @config.effective_idle_compression_threshold,
+            max_recent_messages: @config.effective_compression_max_recent_messages
           )
           return false
         end
@@ -126,24 +126,31 @@ module Clacky
         total_tokens = @previous_total_tokens
         message_count = @history.size
 
+        # Resolve per-model-aware thresholds (model overrides > global defaults)
+        token_threshold    = @config.effective_compression_token_threshold
+        message_threshold  = @config.effective_compression_message_threshold
+        max_recent         = @config.effective_compression_max_recent_messages
+        target_tokens      = @config.effective_compression_target_tokens
+        idle_threshold     = @config.effective_idle_compression_threshold
+
         # Force compression (for idle compression) - use lower threshold
         if force
           # Only compress if we have more than max_recent_messages + system message
-          return nil unless message_count > @config.compression_max_recent_messages + 1
+          return nil unless message_count > max_recent + 1
           # Also require minimum message count to make compression worthwhile
-          return nil unless total_tokens >= @config.idle_compression_threshold
+          return nil unless total_tokens >= idle_threshold
         else
           # Normal compression - check thresholds
           # Either: token count exceeds threshold OR message count exceeds threshold
-          token_threshold_exceeded = total_tokens >= @config.compression_token_threshold
-          message_count_exceeded = message_count >= @config.compression_message_threshold
+          token_threshold_exceeded = total_tokens >= token_threshold
+          message_count_exceeded = message_count >= message_threshold
 
           # Only compress if we exceed at least one threshold
           return nil unless token_threshold_exceeded || message_count_exceeded
         end
 
         # Calculate how much we need to reduce
-        reduction_needed = total_tokens - @config.compression_target_tokens
+        reduction_needed = total_tokens - target_tokens
 
         # Don't compress if reduction is minimal (< 10% of current size)
         # Only apply this check when triggered by token threshold (not for force mode)
@@ -588,12 +595,16 @@ module Clacky
         # This keeps the context window useful without being too large
         tokens_per_message = 500  # Average estimate for a message with content
 
+        # Resolve per-model-aware thresholds
+        effective_target = @config.effective_compression_target_tokens
+        effective_max_recent = @config.effective_compression_max_recent_messages
+
         # Target recent messages budget (~20% of target compressed size)
-        recent_budget = (@config.compression_target_tokens * 0.2).to_i
+        recent_budget = (effective_target * 0.2).to_i
         target_messages = (recent_budget / tokens_per_message).to_i
 
         # Clamp to reasonable bounds
-        [[target_messages, 20].max, @config.compression_max_recent_messages].min
+        [[target_messages, 20].max, effective_max_recent].min
       end
 
       # Generate hierarchical summary based on compression level

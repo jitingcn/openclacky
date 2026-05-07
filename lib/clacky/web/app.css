@@ -3533,6 +3533,44 @@ body {
   align-items: center;
 }
 
+/* Per-model compression overrides (collapsible section inside model card) */
+.compression-overrides-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 8px 0 4px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  transition: color .15s;
+}
+.compression-overrides-toggle:hover {
+  color: var(--color-text-primary);
+}
+.compression-overrides-arrow {
+  transition: transform .15s;
+  flex-shrink: 0;
+}
+.compression-overrides-hint {
+  font-weight: 400;
+  font-style: italic;
+  font-size: 11px;
+  opacity: 0.65;
+}
+.compression-overrides-body {
+  padding: 4px 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.model-field--compact {
+  gap: 4px;
+}
+
 /* ── Modals ──────────────────────────────────────────────────────────────── */
 .modal-overlay {
   position: fixed;

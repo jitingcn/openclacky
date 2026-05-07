@@ -777,7 +777,7 @@ module Clacky
         idle_timer = Clacky::IdleCompressionTimer.new(
           agent:           agent,
           session_manager: session_manager,
-          idle_delay:      agent_config.idle_compression_delay,
+          idle_delay:      agent_config.effective_idle_compression_delay,
           logger:          ->(msg, level:) { ui_controller.log(msg, level: level) }
         ) do |success|
           if success
@@ -868,7 +868,7 @@ module Clacky
             idle_timer = Clacky::IdleCompressionTimer.new(
               agent:           agent,
               session_manager: session_manager,
-              idle_delay:      agent_config.idle_compression_delay,
+              idle_delay:      agent_config.effective_idle_compression_delay,
               logger:          ->(msg, level:) { ui_controller.log(msg, level: level) }
             ) do |success|
               if success

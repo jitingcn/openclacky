@@ -159,6 +159,53 @@ module Clacky
                   :compression_max_recent_messages, :compression_target_tokens,
                   :idle_compression_threshold, :idle_compression_delay
 
+    # Per-model compression override keys that can appear inside
+    # a model entry's "compression_overrides" hash.
+    PER_MODEL_COMPRESSION_KEYS = %w[
+      token_threshold message_threshold
+      max_recent_messages target_tokens
+      idle_threshold idle_delay
+    ].freeze
+
+    # Effective (per-model-aware) accessors for compression settings.
+    # Each method checks the current model's compression_overrides first;
+    # if an override exists it wins, otherwise the global default is used.
+    # This lets users tailor thresholds per model — e.g. DeepSeek with
+    # 500 k context can use a much higher token_threshold than GPT at 200 k.
+
+    def effective_compression_token_threshold
+      model_override(:token_threshold) || @compression_token_threshold
+    end
+
+    def effective_compression_message_threshold
+      model_override(:message_threshold) || @compression_message_threshold
+    end
+
+    def effective_compression_max_recent_messages
+      model_override(:max_recent_messages) || @compression_max_recent_messages
+    end
+
+    def effective_compression_target_tokens
+      model_override(:target_tokens) || @compression_target_tokens
+    end
+
+    def effective_idle_compression_threshold
+      model_override(:idle_threshold) || @idle_compression_threshold
+    end
+
+    def effective_idle_compression_delay
+      model_override(:idle_delay) || @idle_compression_delay
+    end
+
+    # Resolve a single compression override from the current model entry.
+    # Returns nil when the key is absent or the model has no overrides.
+    private def model_override(key)
+      overrides = current_model&.dig("compression_overrides")
+      return nil unless overrides.is_a?(Hash)
+      val = overrides[key.to_s]
+      val.nil? ? nil : val.to_i
+    end
+
     def initialize(options = {})
       @permission_mode = validate_permission_mode(options[:permission_mode])
       @max_tokens = options[:max_tokens] || 16384
@@ -619,8 +666,8 @@ module Clacky
     end
 
     # Add a new model configuration
-    def add_model(model:, api_key:, base_url:, anthropic_format: false, api_type: nil, stream: nil, prompt_caching: nil, type: nil)
-      @models << {
+    def add_model(model:, api_key:, base_url:, anthropic_format: false, api_type: nil, stream: nil, prompt_caching: nil, type: nil, compression_overrides: nil)
+      entry = {
         "id" => SecureRandom.uuid,
         "api_key" => api_key,
         "base_url" => base_url,
@@ -631,6 +678,11 @@ module Clacky
         "prompt_caching" => prompt_caching,
         "type" => type
       }.compact
+      # Per-model compression overrides (optional hash)
+      if compression_overrides.is_a?(Hash) && !compression_overrides.empty?
+        entry["compression_overrides"] = compression_overrides
+      end
+      @models << entry
     end
 
     # Find model by type (default or lite)

@@ -2674,7 +2674,8 @@ module Clacky
             api_type:         m["api_type"],
             stream:           m.key?("stream") ? m["stream"] : nil,
             prompt_caching:   m.key?("prompt_caching") ? m["prompt_caching"] : nil,
-            type:             m["type"]
+            type:             m["type"],
+            compression_overrides: m["compression_overrides"] || {}
           }
         end
         # Filter out auto-injected models (like lite) from UI display
@@ -2787,6 +2788,16 @@ module Clacky
           "stream"           => body.key?("stream") ? body["stream"] : nil,
           "prompt_caching"   => body.key?("prompt_caching") ? body["prompt_caching"] : nil
         }.compact
+        # Per-model compression overrides (optional)
+        if body["compression_overrides"].is_a?(Hash) && !body["compression_overrides"].empty?
+          filtered = {}
+          body["compression_overrides"].each do |k, v|
+            next unless Clacky::AgentConfig::PER_MODEL_COMPRESSION_KEYS.include?(k.to_s)
+            filtered[k.to_s] = v.nil? ? nil : v.to_i
+          end
+          filtered.compact!
+          entry["compression_overrides"] = filtered unless filtered.empty?
+        end
         type = body["type"].to_s
         unless type.empty?
           # Preserve the single-slot "default" invariant.
@@ -2883,6 +2894,31 @@ module Clacky
             target.delete("type")
           else
             target["type"] = new_type
+          end
+        end
+
+        # Per-model compression overrides — a hash with optional keys:
+        #   token_threshold, message_threshold, max_recent_messages,
+        #   target_tokens, idle_threshold, idle_delay
+        # Pass null/empty to clear all overrides for this model.
+        if body.key?("compression_overrides")
+          co = body["compression_overrides"]
+          if co.nil? || (co.is_a?(Hash) && co.empty?)
+            target.delete("compression_overrides")
+          elsif co.is_a?(Hash)
+            # Only keep recognized keys, coerce numeric values to integers
+            filtered = {}
+            co.each do |k, v|
+              next unless Clacky::AgentConfig::PER_MODEL_COMPRESSION_KEYS.include?(k.to_s)
+              filtered[k.to_s] = v.nil? ? nil : v.to_i
+            end
+            # Remove keys with nil values (unset individual overrides)
+            filtered.compact!
+            if filtered.empty?
+              target.delete("compression_overrides")
+            else
+              target["compression_overrides"] = filtered
+            end
           end
         end
 
@@ -3828,7 +3864,7 @@ module Clacky
         Clacky::IdleCompressionTimer.new(
           agent:           agent,
           session_manager: @session_manager,
-          idle_delay:      agent.instance_variable_get(:@config)&.idle_compression_delay || 180
+          idle_delay:      agent.instance_variable_get(:@config)&.effective_idle_compression_delay || 180
         ) do |_success|
           broadcast_session_update(session_id)
         end
