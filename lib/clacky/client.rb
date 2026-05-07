@@ -104,9 +104,15 @@ module Clacky
       # base_urls. This lets e.g. OpenRouter's Claude models auto-route to the
       # native /v1/messages endpoint (preserving cache_control byte-for-byte)
       # without requiring any change to user YAML.
-      provider_prefers_anthropic = provider_id &&
-                                   Providers.anthropic_format_for_model?(provider_id, @model)
-      @use_anthropic_format = provider_prefers_anthropic || anthropic_format
+      #
+      # IMPORTANT: when api_type is explicitly set to "anthropic-messages",
+      # the case statement above already set @use_anthropic_format = true.
+      # Do NOT override it with provider detection.
+      unless resolved_api_type == "anthropic-messages"
+        provider_prefers_anthropic = provider_id &&
+                                     Providers.anthropic_format_for_model?(provider_id, @model)
+        @use_anthropic_format = provider_prefers_anthropic || anthropic_format
+      end
 
       # Remember the provider id so we can tune connection headers below
       # (OpenRouter's /v1/messages accepts either Bearer or x-api-key, but
@@ -206,6 +212,19 @@ module Clacky
         response = bedrock_connection.post(bedrock_endpoint(model)) { |r| r.body = body.to_json }
         parse_simple_bedrock_response(response)
       elsif anthropic_format?
+        # Default to streaming first unless user explicitly disables it.
+        # When stream is forced on (true), streaming failures propagate.
+        # When stream is nil (auto), fall back to non-streaming gracefully.
+        unless @stream == false
+          begin
+            return parse_simple_anthropic_stream_response(model, messages, max_tokens)
+          rescue StandardError
+            raise if @stream == true
+            # @stream == nil: streaming failed, fall through to non-streaming below
+          end
+        end
+
+        # Non-streaming path — either @stream == false or streaming fallback
         body     = MessageFormat::Anthropic.build_request_body(messages, model, [], max_tokens, false)
         inject_cache_affinity!(body, :anthropic)
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
@@ -230,6 +249,19 @@ module Clacky
         end
         parse_simple_anthropic_response(response)
       elsif @use_responses
+        # Default to streaming first unless user explicitly disables it.
+        # When stream is forced on (true), streaming failures propagate.
+        # When stream is nil (auto), fall back to non-streaming gracefully.
+        unless @stream == false
+          begin
+            return parse_simple_responses_stream_response(model, messages, max_tokens)
+          rescue StandardError
+            raise if @stream == true
+            # @stream == nil: streaming failed, fall through to non-streaming below
+          end
+        end
+
+        # Non-streaming path — either @stream == false or streaming fallback
         body     = { model: model, max_output_tokens: max_tokens, store: false, input: messages }
         inject_cache_affinity!(body, :responses)
         response = responses_connection.post("responses") { |r| r.body = body.to_json }
@@ -244,16 +276,23 @@ module Clacky
         end
         parse_simple_responses_response(response)
       else
+        # Default to streaming first unless user explicitly disables it.
+        # When stream is forced on (true), streaming failures propagate.
+        # When stream is nil (auto), fall back to non-streaming gracefully.
+        unless @stream == false
+          begin
+            return parse_simple_openai_stream_response(model, messages, max_tokens)
+          rescue StandardError
+            raise if @stream == true
+            # @stream == nil: streaming failed, fall through to non-streaming below
+          end
+        end
+
+        # Non-streaming path — either @stream == false or streaming fallback
         body = { model: model, max_tokens: max_tokens, messages: messages }
         inject_cache_affinity!(body, :openai)
 
-        # If user explicitly configured stream: true, skip the non-streaming
-        # attempt entirely — go straight to streaming (saves 15s timeout wait).
-        if @stream == true
-          return parse_simple_openai_stream_response(model, messages, max_tokens)
-        end
-
-        # Try non-streaming first with a short timeout (15s).  Some servers
+        # Try non-streaming with a short timeout (15s).  Some servers
         # hang on non-streaming requests because they're streaming-only —
         # catch the timeout and retry with streaming.
         response = begin
@@ -313,7 +352,20 @@ module Clacky
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       response =
         if @use_responses
-          send_responses_request(cloned, model, tools, max_tokens, caching_enabled)
+          # Default to streaming first unless user explicitly disables it.
+          # When stream is forced on (true), streaming failures propagate.
+          # When stream is nil (auto), fall back to non-streaming gracefully.
+          unless @stream == false
+            begin
+              send_responses_stream_request(cloned, model, tools, max_tokens, caching_enabled)
+            rescue StandardError
+              raise if @stream == true
+              # @stream == nil: streaming failed, fall back to non-streaming
+              send_responses_request(cloned, model, tools, max_tokens, caching_enabled)
+            end
+          else
+            send_responses_request(cloned, model, tools, max_tokens, caching_enabled)
+          end
         elsif bedrock?
           send_bedrock_request(cloned, model, tools, max_tokens, caching_enabled)
         elsif anthropic_format?
@@ -360,6 +412,30 @@ module Clacky
       end
     end
 
+    # ── Prompt-caching support ────────────────────────────────────────────────
+
+    # Returns true for Claude models that support prompt caching (gen 3.5+ or gen 4+).
+    #
+    # Handles both direct model names (e.g. "claude-haiku-4-5") and
+    # Clacky AI Bedrock proxy names with "abs-" prefix (e.g. "abs-claude-haiku-4-5").
+    #
+    # Why only Claude models:
+    #   - MiniMax uses automatic server-side caching (no cache_control needed from client)
+    #   - Kimi uses a proprietary prompt_cache_key param, not cache_control
+    #   - MiMo has no documented caching API
+    #   - Only Claude (direct, OpenRouter, or ClackyAI Bedrock proxy) consumes our
+    #     cache_control / cachePoint markers
+    def supports_prompt_caching?(model)
+      # Strip ClackyAI Bedrock proxy prefix before matching
+      model_str = model.to_s.downcase.sub(/^abs-/, "")
+      return false unless model_str.include?("claude")
+
+      # Match Claude gen 3.5+ (3.5/3.6/3.7…) or gen 4+ in any name format:
+      #   claude-3.5-sonnet-...  claude-3-7-sonnet  claude-haiku-4-5  claude-sonnet-4-6
+      model_str.match?(/claude(?:-3[-.]?[5-9]|.*-[4-9][-.]|.*-[4-9]$|-[4-9][-.]|-[4-9]$|-sonnet-[34])/)
+    end
+
+
     # ── Cache affinity injection ───────────────────────────────────────────────
     #
     # Inject session identity fields into the request body so that aggregation
@@ -396,30 +472,6 @@ module Clacky
       body
     end
 
-    # ── Prompt-caching support ────────────────────────────────────────────────
-
-    # Returns true for Claude models that support prompt caching (gen 3.5+ or gen 4+).
-    #
-    # Handles both direct model names (e.g. "claude-haiku-4-5") and
-    # Clacky AI Bedrock proxy names with "abs-" prefix (e.g. "abs-claude-haiku-4-5").
-    #
-    # Why only Claude models:
-    #   - MiniMax uses automatic server-side caching (no cache_control needed from client)
-    #   - Kimi uses a proprietary prompt_cache_key param, not cache_control
-    #   - MiMo has no documented caching API
-    #   - Only Claude (direct, OpenRouter, or ClackyAI Bedrock proxy) consumes our
-    #     cache_control / cachePoint markers
-    def supports_prompt_caching?(model)
-      # Strip ClackyAI Bedrock proxy prefix before matching
-      model_str = model.to_s.downcase.sub(/^abs-/, "")
-      return false unless model_str.include?("claude")
-
-      # Match Claude gen 3.5+ (3.5/3.6/3.7…) or gen 4+ in any name format:
-      #   claude-3.5-sonnet-...  claude-3-7-sonnet  claude-haiku-4-5  claude-sonnet-4-6
-      model_str.match?(/claude(?:-3[-.]?[5-9]|.*-[4-9][-.]|.*-[4-9]$|-[4-9][-.]|-[4-9]$|-sonnet-[34])/)
-    end
-
-
     # ── Bedrock Converse request / response ───────────────────────────────────
 
     def send_bedrock_request(messages, model, tools, max_tokens, caching_enabled)
@@ -447,12 +499,28 @@ module Clacky
       # Apply cache_control to the message that marks the cache breakpoint
       messages = apply_message_caching(messages) if caching_enabled
 
+      # Default to streaming first unless user explicitly disables it.
+      # When stream is forced on (true), streaming failures propagate.
+      # When stream is nil (auto), fall back to non-streaming gracefully.
+      unless @stream == false
+        begin
+          return send_anthropic_stream_request(messages, model, tools, max_tokens, caching_enabled)
+        rescue StandardError
+          raise if @stream == true
+          # @stream == nil: streaming failed, fall through to non-streaming below
+        end
+      end
+
+      # Non-streaming path — either @stream == false or streaming fallback
       body     = MessageFormat::Anthropic.build_request_body(messages, model, tools, max_tokens, caching_enabled)
       inject_cache_affinity!(body, :anthropic)
-      response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
+      response = anthropic_connection.post(anthropic_messages_path) { |r|
+        r.body = body.to_json
+        r.headers["x-client-request-id"] = SecureRandom.uuid
+      }
 
       # Some providers require streaming even for Anthropic-format endpoints.
-      # When we get a 400 with "stream" in the error, fall back to Responses API.
+      # When we get a 400 with "stream" in the error, fall back to streaming.
       if response.status == 400
         error_body = begin
           JSON.parse(response.body)
@@ -476,12 +544,6 @@ module Clacky
       check_html_response(response)
       parsed_body = safe_json_parse(response.body, context: "LLM response")
       MessageFormat::Anthropic.parse_response(parsed_body)
-    end
-
-    def parse_simple_anthropic_response(response)
-      raise_error(response) unless response.status == 200
-      data = safe_json_parse(response.body, context: "LLM response")
-      (data["content"] || []).select { |b| b["type"] == "text" }.map { |b| b["text"] }.join("")
     end
 
     # Streaming variant of send_anthropic_request.  Reads the response body
@@ -521,6 +583,12 @@ module Clacky
       MessageFormat::Anthropic.parse_stream_response(chunks)
     end
 
+    def parse_simple_anthropic_response(response)
+      raise_error(response) unless response.status == 200
+      data = safe_json_parse(response.body, context: "LLM response")
+      (data["content"] || []).select { |b| b["type"] == "text" }.map { |b| b["text"] }.join("")
+    end
+
     # Streaming variant of parse_simple_anthropic_response.  Returns accumulated text.
     def parse_simple_anthropic_stream_response(model, messages, max_tokens)
       body = MessageFormat::Anthropic.build_stream_request_body(
@@ -550,10 +618,16 @@ module Clacky
       # OpenRouter proxies Claude with the same cache_control field convention as Anthropic direct.
       messages = apply_message_caching(messages) if caching_enabled
 
-      # If user explicitly configured stream: true, skip the non-streaming
-      # attempt entirely — go straight to streaming (saves 15s timeout wait).
-      if @stream == true
-        return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      # Default to streaming first unless user explicitly disables it.
+      # When stream is forced on (true), streaming failures propagate.
+      # When stream is nil (auto), we fall back to non-streaming gracefully.
+      unless @stream == false
+        begin
+          return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+        rescue StandardError
+          raise if @stream == true
+          # @stream == nil: streaming failed, fall through to non-streaming below
+        end
       end
 
       body     = MessageFormat::OpenAI.build_request_body(
@@ -989,9 +1063,16 @@ module Clacky
     def anthropic_connection
       @anthropic_connection ||= Faraday.new(url: @base_url) do |conn|
         conn.headers["Content-Type"]   = "application/json"
+        conn.headers["Accept"]         = "application/json"
         conn.headers["x-api-key"]      = @api_key
         conn.headers["anthropic-version"] = "2023-06-01"
         conn.headers["anthropic-dangerous-direct-browser-access"] = "true"
+        # Claude Code-shaped client identity headers help certain aggregation
+        # / coding channels route Anthropic-compatible traffic correctly.
+        # Keep these generic headers enabled by default, while preserving
+        # provider-specific auth / UA overrides below.
+        conn.headers["x-app"] = "cli"
+        conn.headers["X-Claude-Code-Session-Id"] = @cache_affinity_session_id
         # OpenRouter's /v1/messages endpoint authenticates with a Bearer
         # token (the OpenRouter API key), not Anthropic's x-api-key. We send
         # both so the same connection code works for direct Anthropic and

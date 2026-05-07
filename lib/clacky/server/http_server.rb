@@ -2849,7 +2849,7 @@ module Clacky
           val = body["api_type"].to_s.strip
           target["api_type"] = val.empty? ? nil : val
         end
-        # stream: true (always streaming), false (never streaming), null (auto — try non-streaming first)
+        # stream: true (always streaming), false (never streaming), null (auto — try streaming first)
         if body.key?("stream")
           target["stream"] = body["stream"]
         end

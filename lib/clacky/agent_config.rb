@@ -587,7 +587,7 @@ module Clacky
     end
 
     # Get stream preference for current model.
-    # true = always use streaming, false = force non-streaming, nil = auto (try non-stream first, fallback to stream)
+    # true = always use streaming, false = force non-streaming, nil = auto (try streaming first, fallback to non-stream)
     def stream
       current_model&.dig("stream")
     end

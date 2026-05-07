@@ -70,16 +70,17 @@ RSpec.describe Clacky::Client, "OpenRouter Anthropic routing" do
       expect(conn.headers["anthropic-version"]).to eq("2023-06-01")
     end
 
-    it "does not add an Authorization header for direct Anthropic" do
-      # Anthropic's API rejects requests with an Authorization header set to
-      # an api-key value; only x-api-key is valid there.
+    it "sends Authorization header for direct Anthropic too (matching Claude Code behavior)" do
+      # Claude Code 2.1.x sends Authorization: Bearer {token} along with
+      # x-api-key for all Anthropic connections. Both headers are sent so
+      # the same connection code works for direct Anthropic and proxy setups.
       direct = described_class.new("sk-ant-test",
                                    base_url: "https://api.anthropic.com",
                                    model: "claude-sonnet-4.6",
                                    anthropic_format: true)
       conn = direct.send(:anthropic_connection)
       expect(conn.headers["x-api-key"]).to eq("sk-ant-test")
-      expect(conn.headers["Authorization"]).to be_nil
+      expect(conn.headers["Authorization"]).to eq("Bearer sk-ant-test")
     end
   end
 

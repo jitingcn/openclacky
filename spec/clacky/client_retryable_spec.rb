@@ -102,6 +102,7 @@ RSpec.describe Clacky::Client do
       allow(req_stub).to receive(:body=)
       allow(req_stub).to receive(:options).and_return(opts_stub)
       allow(opts_stub).to receive(:timeout=)
+      allow(opts_stub).to receive(:on_data=)  # streaming path support
 
       conn = instance_double(Faraday::Connection)
       allow(conn).to receive(:post).and_yield(req_stub).and_return(response)
