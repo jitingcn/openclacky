@@ -2945,11 +2945,16 @@ module Clacky
 
         begin
           model = body["model"].to_s
+          api_type_value = body["api_type"].to_s.strip
+          api_type_value = nil if api_type_value.empty?
+          stream_value = body.key?("stream") ? body["stream"] : nil
           test_client = Clacky::Client.new(
             api_key,
             base_url:         body["base_url"].to_s,
             model:            model,
-            anthropic_format: body["anthropic_format"] || false
+            anthropic_format: body["anthropic_format"] || false,
+            api_type:         api_type_value,
+            stream:           stream_value
           )
           result = test_client.test_connection(model: model)
           if result[:success]

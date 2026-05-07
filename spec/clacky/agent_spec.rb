@@ -81,6 +81,75 @@ RSpec.describe Clacky::Agent do
       expect(agent.total_cost).to be > 0
     end
 
+    context "auto-retry on action plan without tool calls" do
+      let(:action_plan_response) do
+        mock_api_response(content: "好的，我来提交代码修改", tool_calls: nil)
+      end
+
+      let(:real_action_response) do
+        mock_api_response(
+          content: nil,
+          tool_calls: [mock_tool_call(name: "shell", args: '{"command":"git commit"}')]
+        )
+      end
+
+      let(:real_final_response) do
+        mock_api_response(content: "代码已提交完成 ✅", tool_calls: nil)
+      end
+
+      before do
+        allow(client).to receive(:send_messages_with_tools)
+          .and_return(action_plan_response, real_action_response, real_final_response)
+        allow(client).to receive(:format_tool_results) do |response, tool_results, model:|
+          response[:tool_calls].map do |call|
+            result = tool_results.find { |r| r[:id] == call[:id] }
+            {
+              role: "tool",
+              tool_call_id: call[:id],
+              content: result ? result[:content] : JSON.generate({ error: "Tool result missing" })
+            }
+          end
+        end
+      end
+
+      it "auto-retries when model describes action plan without calling tools" do
+        result = agent.run("提交代码")
+
+        expect(result[:status]).to eq(:success)
+        # Should call LLM at least twice (original + auto-retry)
+        expect(client).to have_received(:send_messages_with_tools).at_least(:twice)
+
+        # Should have injected the auto-retry prompt in history
+        retry_prompts = agent.history.to_a.select { |m|
+          m[:role] == "user" && m[:content]&.include?("Please use tools to accomplish this task")
+        }
+        expect(retry_prompts.size).to eq(1)
+        expect(retry_prompts.first[:system_injected]).to be true
+      end
+
+      it "does not auto-retry on completion summaries" do
+        completed_response = mock_api_response(content: "已完成提交 ✅ 共 3 个文件被修改", tool_calls: nil)
+
+        allow(client).to receive(:send_messages_with_tools)
+          .and_return(completed_response)
+
+        result = agent.run("提交代码")
+
+        expect(result[:status]).to eq(:success)
+        expect(client).to have_received(:send_messages_with_tools).once
+      end
+
+      it "does not auto-retry twice (prevents infinite loop)" do
+        allow(client).to receive(:send_messages_with_tools)
+          .and_return(action_plan_response, action_plan_response)
+
+        result = agent.run("提交代码")
+
+        expect(result[:status]).to eq(:success)
+        expect(client).to have_received(:send_messages_with_tools).twice
+      end
+    end
+
 
   end
 

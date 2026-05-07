@@ -360,6 +360,9 @@ module Clacky
         awaiting_user_feedback = false
         # Track if task was interrupted by user (denied tool execution)
         task_interrupted = false
+        # Track if we already performed an auto-retry for this task
+        # (model described action plan without tool calls on first iteration)
+        task_auto_retried = false
 
         loop do
           @iterations += 1
@@ -434,6 +437,20 @@ module Clacky
 
             # Show token usage after the assistant message so WebUI renders it below the bubble
             @ui&.show_token_usage(response[:token_usage]) if response[:token_usage]
+
+            # Auto-retry: some models (e.g. gpt-5.3-codex) occasionally describe an
+            # action plan on the first iteration without actually calling tools.
+            # When detected, inject a follow-up prompt and let the model try again.
+            # Only retry when the model returned text with NO tool calls at all.
+            if !task_auto_retried && @iterations == @task_start_iterations + 1 &&
+               (response[:tool_calls].nil? || response[:tool_calls].empty?) &&
+               response[:content] && !response[:content].empty? &&
+               action_plan_without_tools?(response[:content])
+              task_auto_retried = true
+              @ui&.show_info("Model described intent without tool calls — auto-continuing...")
+              @history.append({ role: "user", content: "Please use tools to accomplish this task now. Do not just describe what you will do — take action.", system_injected: true, task_id: task_id })
+              next
+            end
 
             # Debug: log why we're stopping
             if @config.verbose && (response[:tool_calls].nil? || response[:tool_calls].empty?)
@@ -1536,6 +1553,41 @@ module Clacky
 
       parsed = parse_file_links(content)
       @ui&.show_assistant_message(parsed[:text], files: parsed[:files])
+    end
+
+    # Detect whether a model response describes an action plan without
+    # actually calling tools. Used for auto-retry when models like
+    # gpt-5.3-codex occasionally output "I'll do X" instead of doing X.
+    #
+    # Heuristic: the content starts with acknowledgment words and contains
+    # action-intent phrases, but lacks completion indicators (✅, "done", etc.).
+    private def action_plan_without_tools?(content)
+      text = content.to_s.strip
+      return false if text.empty? || text.length > 800  # Long responses are likely real answers
+
+      # Completion indicators — if present, this is a final answer, not a plan
+      completion_patterns = [
+        /✅|✔️|🎉|👍/,
+        /已完成|已修改|已提交|已保存|已创建|已删除/,
+        /done[.!]?|finished[.!]?|completed[.!]?/i,
+        /\btask (is )?(complete|done|finished)\b/i,
+        /(以上|上述|所有).*(完成|修改|更新)/,
+        /\bno changes?( needed| required)?\b/i
+      ]
+      return false if completion_patterns.any? { |p| text.match?(p) }
+
+      # Action-intent phrases — model says it WILL do something
+      action_patterns = [
+        /我来|我会|让我来|让我/,
+        /好的[，,]?\s*我/,
+        /了解[，,]?\s*我/,
+        /明白[，,]?\s*我/,
+        /\bI'll\b|\bI will\b|\blet me\b/i,
+        /\bI('m| am) going to\b/i,
+        /\bI need to\b|\bI should\b/i,
+        /\bLet's\b|\bWe('ll| will)\b/i
+      ]
+      action_patterns.any? { |p| text.match?(p) }
     end
 
     # Track modified files for Time Machine snapshots

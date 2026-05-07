@@ -119,12 +119,42 @@ module Clacky
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = minimal_body }
       elsif @use_responses
         minimal_body = { model: model, max_output_tokens: 16, store: false,
-                         input: [{ role: "user", content: "hi" }] }.to_json
-        response = responses_connection.post("responses") { |r| r.body = minimal_body }
+                         input: [{ role: "user", content: "hi" }] }
+        minimal_body[:stream] = true if @stream
+        response = responses_connection.post("responses") { |r| r.body = minimal_body.to_json }
+
+        # Auto mode: retry with streaming if server requires it
+        if response.status == 400 && @stream.nil?
+          error_body = begin
+            JSON.parse(response.body)
+          rescue
+            {}
+          end
+          error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+          if error_msg.match?(/stream/i)
+            minimal_body[:stream] = true
+            response = responses_connection.post("responses") { |r| r.body = minimal_body.to_json }
+          end
+        end
       else
         minimal_body = { model: model, max_tokens: 16,
-                         messages: [{ role: "user", content: "hi" }] }.to_json
-        response = openai_connection.post("chat/completions") { |r| r.body = minimal_body }
+                         messages: [{ role: "user", content: "hi" }] }
+        minimal_body[:stream] = true if @stream
+        response = openai_connection.post("chat/completions") { |r| r.body = minimal_body.to_json }
+
+        # Auto mode: retry with streaming if server requires it
+        if response.status == 400 && @stream.nil?
+          error_body = begin
+            JSON.parse(response.body)
+          rescue
+            {}
+          end
+          error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
+          if error_msg.match?(/stream/i)
+            minimal_body[:stream] = true
+            response = openai_connection.post("chat/completions") { |r| r.body = minimal_body.to_json }
+          end
+        end
       end
       handle_test_response(response)
     rescue Faraday::Error => e
