@@ -41,6 +41,7 @@ module Clacky
 
       Examples:
         $ clacky agent --mode=auto_approve --path /path/to/project
+        $ clacky agent --model gpt-5.3-codex -m "write a hello world script"
     LONGDESC
     option :mode, type: :string, default: "confirm_safes",
            desc: "Permission mode: auto_approve, confirm_safes, confirm_all"
@@ -56,6 +57,7 @@ module Clacky
     option :file,  type: :array, aliases: "-f", desc: "File path(s) to attach (use with -m; supports images and documents)"
     option :image, type: :array, aliases: "-i", desc: "Image file path(s) to attach (alias for --file, kept for compatibility)"
     option :agent, type: :string, default: "coding", desc: "Agent profile to use: coding, general, or any custom profile name (default: coding)"
+    option :model, type: :string, desc: "Override the model to use (by name, e.g. gpt-5.3-codex or deepseek-v4-pro). Uses default model if not specified"
     option :help, type: :boolean, aliases: "-h", desc: "Show this help message"
     def agent
       # Handle help option
@@ -69,6 +71,15 @@ module Clacky
       Clacky::Telemetry.startup!
 
       agent_config = Clacky::AgentConfig.load
+
+      # Override model if --model option is specified
+      if options[:model]
+        unless agent_config.switch_model_by_name(options[:model])
+          # During early startup @ui may not be ready; use simple error output
+          $stderr.puts "Error: model '#{options[:model]}' not found. Available: #{agent_config.model_names.join(', ')}"
+          exit 1
+        end
+      end
 
       # Handle session listing
       if options[:list]
@@ -102,7 +113,9 @@ module Clacky
           agent_config.api_key,
           base_url: agent_config.base_url,
           model: agent_config.model_name,
-          anthropic_format: agent_config.anthropic_format?
+          anthropic_format: agent_config.anthropic_format?,
+          api_type: agent_config.api_type,
+          stream: agent_config.stream
         )
       end
 
@@ -171,7 +184,9 @@ module Clacky
             test_config.api_key,
             base_url: test_config.base_url,
             model: test_config.model_name,
-            anthropic_format: test_config.anthropic_format?
+            anthropic_format: test_config.anthropic_format?,
+            api_type: test_config.api_type,
+            stream: test_config.stream
           )
           test_client.test_connection(model: test_config.model_name)
         end
@@ -231,7 +246,20 @@ module Clacky
         ui_controller.append_output("  Current Model: #{config.model_name}")
         ui_controller.append_output("  API Key: #{masked_key}")
         ui_controller.append_output("  Base URL: #{config.base_url}")
-        ui_controller.append_output("  Format: #{config.anthropic_format? ? 'Anthropic' : 'OpenAI'}")
+        api_type_label = case config.api_type
+                         when "openai-completions" then "Chat Completions"
+                         when "openai-responses" then "Responses API"
+                         when "anthropic-messages" then "Anthropic Messages"
+                         when "bedrock" then "Bedrock"
+                         else "Auto-detect"
+                         end
+        stream_label = case config.stream
+                       when true then "Always"
+                       when false then "Never"
+                       else "Auto"
+                       end
+        ui_controller.append_output("  API Type: #{api_type_label}")
+        ui_controller.append_output("  Streaming: #{stream_label}")
         ui_controller.append_output("")
       end
 
@@ -707,10 +735,11 @@ module Clacky
         # Track current working thread (agent or idle compression that can be interrupted)
         current_task_thread = nil
 
-        # Idle compression timer - triggers compression after 180s of inactivity
+        # Idle compression timer - triggers compression after configurable idle delay
         idle_timer = Clacky::IdleCompressionTimer.new(
           agent:           agent,
           session_manager: session_manager,
+          idle_delay:      agent_config.effective_idle_compression_delay,
           logger:          ->(msg, level:) { ui_controller.log(msg, level: level) }
         ) do |success|
           if success
@@ -801,6 +830,7 @@ module Clacky
             idle_timer = Clacky::IdleCompressionTimer.new(
               agent:           agent,
               session_manager: session_manager,
+              idle_delay:      agent_config.effective_idle_compression_delay,
               logger:          ->(msg, level:) { ui_controller.log(msg, level: level) }
             ) do |success|
               if success
@@ -970,7 +1000,9 @@ module Clacky
             agent_config.api_key,
             base_url: agent_config.base_url,
             model: agent_config.model_name,
-            anthropic_format: agent_config.anthropic_format?
+            anthropic_format: agent_config.anthropic_format?,
+            api_type: agent_config.api_type,
+            stream: agent_config.stream
           )
         end
 

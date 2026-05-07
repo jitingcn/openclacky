@@ -29,8 +29,43 @@ RSpec.describe "Compression system-prompt duplication bug" do
         @session_id            = nil   # disable chunk saving
         @created_at            = nil
         # MessageCompressorHelper accesses @config directly as an ivar
-        config_klass = Struct.new(:enable_compression)
-        @config      = config_klass.new(true)
+        config_klass = Struct.new(
+          :enable_compression,
+          :compression_token_threshold,
+          :compression_message_threshold,
+          :compression_max_recent_messages,
+          :compression_target_tokens,
+          :idle_compression_threshold,
+          :idle_compression_delay
+        ) do
+          # Per-model-aware accessors — in test contexts (no real AgentConfig)
+          # these simply delegate to the global (struct) fields since there
+          # is no current_model with compression_overrides.
+          def effective_compression_token_threshold
+            compression_token_threshold
+          end
+
+          def effective_compression_message_threshold
+            compression_message_threshold
+          end
+
+          def effective_compression_max_recent_messages
+            compression_max_recent_messages
+          end
+
+          def effective_compression_target_tokens
+            compression_target_tokens
+          end
+
+          def effective_idle_compression_threshold
+            idle_compression_threshold
+          end
+
+          def effective_idle_compression_delay
+            idle_compression_delay
+          end
+        end
+        @config      = config_klass.new(true, 150_000, 200, 20, 10_000, 20_000, 180)
         # compress_messages_if_needed calls @message_compressor.build_compression_message
         @message_compressor = Clacky::MessageCompressor.new(nil)
       end
@@ -142,8 +177,8 @@ RSpec.describe "Compression system-prompt duplication bug" do
         messages << { role: "assistant", content: "Answer #{i}" }
       end
 
-      # Simulate tokens slightly above IDLE_COMPRESSION_THRESHOLD
-      prev_tokens = Clacky::Agent::MessageCompressorHelper::IDLE_COMPRESSION_THRESHOLD + 1_000
+      # Simulate tokens slightly above IDLE_COMPRESSION_THRESHOLD (default: 20_000)
+      prev_tokens = 21_000
 
       agent = build_agent(messages: messages, previous_total_tokens: prev_tokens)
 
