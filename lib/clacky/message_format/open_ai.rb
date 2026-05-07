@@ -170,7 +170,11 @@ module Clacky
         finish_reason = nil
         usage_data = {}
 
-        lines.each do |line|
+        idx = 0
+        while idx < lines.size
+          line = lines[idx]
+          idx += 1
+
           next unless line.start_with?("data: ")
 
           data_str = line[6..]  # strip "data: " prefix
@@ -179,10 +183,34 @@ module Clacky
           chunk = begin
             JSON.parse(data_str)
           rescue JSON::ParserError
-            next
+            # Faraday's on_data splits by network packet boundary, not by SSE
+            # line boundary. A single "data: {...}" line may be split across
+            # multiple chunks, producing incomplete JSON on the first line.
+            # Try merging subsequent lines until we get valid JSON.
+            merged = data_str
+            while idx < lines.size
+              next_line = lines[idx]
+              idx += 1
+              # Stop if we hit a new SSE event or DONE marker
+              break if next_line.start_with?("data: ") || next_line.strip.empty?
+              merged << next_line
+              begin
+                break chunk = JSON.parse(merged)
+              rescue JSON::ParserError
+                # Continue merging
+              end
+            end
+            # If we still can't parse, skip this fragment
+            next unless chunk.is_a?(Hash)
+            chunk
           end
 
           choice = chunk.dig("choices", 0)
+
+          # Usage arrives in the final chunk where choices is an empty array.
+          # Must extract usage BEFORE the "next unless choice" guard.
+          usage_data = chunk["usage"] if chunk["usage"].is_a?(Hash) && chunk["usage"]["prompt_tokens"]
+
           next unless choice
 
           delta = choice["delta"] || {}
@@ -196,9 +224,9 @@ module Clacky
           # Accumulate tool calls (arrive incrementally by index)
           if delta["tool_calls"]
             delta["tool_calls"].each do |tc|
-              idx = tc["index"]
-              tool_calls_map[idx] ||= { id: +"", type: "function", name: +"", arguments: +"" }
-              entry = tool_calls_map[idx]
+              tc_idx = tc["index"]
+              tool_calls_map[tc_idx] ||= { id: +"", type: "function", name: +"", arguments: +"" }
+              entry = tool_calls_map[tc_idx]
               # id and name are complete values (sent once or repeated identically),
               # NOT incrementally built like arguments — use = not <<.
               # Using << would concatenate the same value across chunks,
@@ -214,8 +242,9 @@ module Clacky
           # Track finish reason (appears in later chunks)
           finish_reason = choice["finish_reason"] if choice["finish_reason"]
 
-          # Usage arrives in the last chunk
-          usage_data = chunk["usage"] if chunk["usage"]
+          # Redundant usage extraction: some providers include usage in chunks
+          # that also have choices (not just the final empty-choices chunk).
+          usage_data = chunk["usage"] if chunk["usage"] && chunk["usage"]["prompt_tokens"]
         end
 
         # Build canonical tool_calls array sorted by index
