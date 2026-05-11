@@ -1218,6 +1218,7 @@ module Clacky
         conn.headers["Content-Type"]   = "application/json"
         conn.headers["Accept"]         = "application/json"
         conn.headers["x-api-key"]      = @api_key
+        conn.headers["Authorization"]   = "Bearer #{@api_key}"
         conn.headers["anthropic-version"] = "2023-06-01"
         conn.headers["anthropic-dangerous-direct-browser-access"] = "true"
         # Claude Code-shaped client identity headers help certain aggregation
