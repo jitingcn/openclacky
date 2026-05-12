@@ -573,6 +573,7 @@ module Clacky
       messages = apply_message_caching(messages) if caching_enabled
 
       body = MessageFormat::Anthropic.build_stream_request_body(messages, model, tools, max_tokens, caching_enabled)
+      inject_cache_affinity!(body, :anthropic)
 
       chunks = []
       response = anthropic_connection.post(anthropic_messages_path) do |req|
@@ -612,6 +613,7 @@ module Clacky
       body = MessageFormat::Anthropic.build_stream_request_body(
         messages, model, [], max_tokens, false
       )
+      inject_cache_affinity!(body, :anthropic)
 
       chunks = []
       response = anthropic_connection.post(anthropic_messages_path) do |req|

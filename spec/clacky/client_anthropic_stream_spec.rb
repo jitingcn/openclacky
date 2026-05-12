@@ -218,4 +218,81 @@ RSpec.describe Clacky::Client, "Anthropic streaming transport" do
     expect(captured_body.key?("stream")).to eq(false)
     test.verify_stubbed_calls
   end
+
+  it "injects metadata.user_id (cache affinity) in the streaming agent path" do
+    response_body = sse_body(
+      ["message_start", { type: "message_start", message: { id: "msg_affinity", usage: { input_tokens: 5 } } }],
+      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+      ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } }],
+      ["content_block_stop", { type: "content_block_stop", index: 0 }],
+      ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }],
+      ["message_stop", { type: "message_stop" }]
+    )
+
+    captured_body = nil
+    test = Faraday::Adapter::Test::Stubs.new do |stub|
+      stub.post("/v1/messages") do |env|
+        captured_body = JSON.parse(env.body)
+        env.request.on_data.call(response_body, response_body.bytesize, env) if env.request.on_data
+        [200, { "Content-Type" => "text/event-stream" }, ""]
+      end
+    end
+
+    connection = Faraday.new(url: base_url) do |conn|
+      conn.adapter :test, test
+    end
+
+    client = build_client(connection: connection)
+    client.send_messages_with_tools(
+      [{ role: "user", content: "hi" }],
+      model: model,
+      tools: [],
+      max_tokens: 64,
+      enable_caching: false
+    )
+
+    # Verify cache affinity metadata is injected in the streaming request body
+    expect(captured_body["metadata"]).to be_a(Hash)
+    user_id_json = captured_body["metadata"]["user_id"]
+    parsed = JSON.parse(user_id_json)
+    expect(parsed).to include("device_id", "account_uuid", "session_id")
+    expect(parsed["session_id"]).to eq(client.cache_affinity_session_id)
+
+    test.verify_stubbed_calls
+  end
+
+  it "injects metadata.user_id (cache affinity) in the simple streaming path" do
+    response_body = sse_body(
+      ["message_start", { type: "message_start", message: { id: "msg_simple_affinity", usage: { input_tokens: 3 } } }],
+      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+      ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "pong" } }],
+      ["content_block_stop", { type: "content_block_stop", index: 0 }],
+      ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }],
+      ["message_stop", { type: "message_stop" }]
+    )
+
+    captured_body = nil
+    test = Faraday::Adapter::Test::Stubs.new do |stub|
+      stub.post("/v1/messages") do |env|
+        captured_body = JSON.parse(env.body)
+        env.request.on_data.call(response_body, response_body.bytesize, env) if env.request.on_data
+        [200, { "Content-Type" => "text/event-stream" }, ""]
+      end
+    end
+
+    connection = Faraday.new(url: base_url) do |conn|
+      conn.adapter :test, test
+    end
+
+    client = build_client(connection: connection)
+    client.send_messages([{ role: "user", content: "ping" }], model: model, max_tokens: 16)
+
+    # Verify cache affinity metadata is injected in the simple streaming path
+    expect(captured_body["metadata"]).to be_a(Hash)
+    user_id_json = captured_body["metadata"]["user_id"]
+    parsed = JSON.parse(user_id_json)
+    expect(parsed["session_id"]).to eq(client.cache_affinity_session_id)
+
+    test.verify_stubbed_calls
+  end
 end
