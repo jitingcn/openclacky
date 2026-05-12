@@ -473,7 +473,8 @@ module Clacky
         when "assistant"
           # Text content
           text = extract_text_from_content(msg[:content]).to_s.strip
-          ui.show_assistant_message(text, files: []) unless text.empty?
+          reasoning_content = msg[:reasoning_content]
+          ui.show_assistant_message(text, files: [], reasoning_content: reasoning_content) unless text.empty? && reasoning_content.to_s.strip.empty?
 
           # Tool calls embedded in assistant message
           Array(msg[:tool_calls]).each do |tc|

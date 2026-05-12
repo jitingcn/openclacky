@@ -42,8 +42,8 @@ RSpec.describe "replay_history chunk MD expansion" do
       @events << { type: :user, content: content, created_at: created_at }
     end
 
-    def show_assistant_message(content, files:)
-      @events << { type: :assistant, content: content }
+    def show_assistant_message(content, files:, reasoning_content: nil)
+      @events << { type: :assistant, content: content, reasoning_content: reasoning_content }
     end
 
     def show_tool_call(name, args)
@@ -328,6 +328,22 @@ RSpec.describe "replay_history chunk MD expansion" do
   end
 
   describe "replay_history with compressed sessions" do
+    it "preserves reasoning_content on replayed assistant messages" do
+      messages = [
+        { role: "system", content: "System." },
+        { role: "user", content: "Question" },
+        { role: "assistant", content: "Answer", reasoning_content: "Hidden reasoning" }
+      ]
+
+      agent = build_agent(messages)
+      collector = TestCollector.new
+      agent.replay_history(collector)
+
+      assistant = collector.events.find { |e| e[:type] == :assistant }
+      expect(assistant[:content]).to eq("Answer")
+      expect(assistant[:reasoning_content]).to eq("Hidden reasoning")
+    end
+
     it "expands chunk rounds when history contains only a compressed summary" do
       chunk_path = File.join(sessions_dir, "chunk-1.md")
       File.write(chunk_path, chunk_md(

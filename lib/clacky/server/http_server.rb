@@ -54,12 +54,14 @@ module Clacky
         @events << ev
       end
 
-      def show_assistant_message(content, files:)
-        return if content.nil? || content.to_s.strip.empty?
+      def show_assistant_message(content, files:, reasoning_content: nil)
+        return if (content.nil? || content.to_s.strip.empty?) && reasoning_content.to_s.strip.empty?
 
         # Rewrite local image paths to /api/local-image proxy URLs for browser rendering
         rewritten = Utils::FileProcessor.rewrite_local_image_urls(content.to_s)
-        @events << { type: "assistant_message", session_id: @session_id, content: rewritten }
+        ev = { type: "assistant_message", session_id: @session_id, content: rewritten }
+        ev[:reasoning_content] = reasoning_content.to_s unless reasoning_content.to_s.strip.empty?
+        @events << ev
       end
 
       def show_tool_call(name, args)
