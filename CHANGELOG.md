@@ -5,29 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.5] - 2026-05-12
-
-### Added
-- **Telegram channel adapter.** New IM channel adapter that connects openclacky to Telegram via the Bot API. Setup is just a bot token from @BotFather — no browser automation, no QR. Mirrors the existing Feishu / WeCom / Weixin contract: HTTPS long-poll inbound, `sendMessage` / `sendPhoto` / `sendDocument` outbound, photo + document download routed through the standard FileProcessor + vision pipeline, group `@-mention` filtering and `allowed_users` whitelist. `base_url` is configurable to support self-hosted Bot API servers (https://github.com/tdlib/telegram-bot-api) for networks where `api.telegram.org` is unreachable. Frontend Channels panel, `channel-setup` skill, English/Chinese i18n, and `app.css` logo class added. 32 new specs in `spec/clacky/server/channel/adapters/telegram/`.
-- **Discord channel adapter.** Full Discord integration via REST API + Gateway (WebSocket), with channel-setup support, Web UI Channels panel entry, and i18n strings. Connect Clacky to Discord servers for bot interactions through slash commands and message events.
-- **OpenRouter curated model list.** The OpenRouter provider now ships with a curated dropdown of mainstream Claude and GPT models (Sonnet, Opus, Haiku, GPT-5.5/5.4), so users can pick from the list instead of typing model IDs manually. Full catalogue still accessible by typing any model ID.
-- **OpenRouter lite model pairing.** Subagents on OpenRouter now automatically get a sensible cheap/fast sidekick — Claude family pairs with Haiku, GPT family pairs with the mini variant — matching the behavior already available on the native OpenAI and OpenClacky providers.
-- **MiMo 2.5 Pro (Xiaomi) model support.** Added `mimo-v2.5-pro` to the MiMo provider preset alongside existing MiMo models.
-- **AI key setup guide link.** New users and those configuring API keys now see a "New to AI keys? See the guide →" link on both onboarding and settings pages, pointing to the official documentation.
-
-### Improved
-- **Default model upgraded to claude-sonnet-4-6.** The OpenClacky provider now defaults to the latest Claude Sonnet model for better performance out of the box.
-
-### Fixed
-- **Linux server restart stability.** Fixed an inherited socket cleanup bug where WEBrick's shutdown would propagate `SHUT_RDWR` to the shared kernel socket, breaking subsequent `accept()` calls on Linux. The server now detaches inherited sockets before shutdown so worker restarts work reliably.
-- **Upgrade failure recovery UI.** When an in-app upgrade restart fails, the UI now shows both tray icon and CLI recovery paths (`gem update ...`) instead of leaving users stranded. Also added branded CLI command info to the version check API for white-label builds.
-
-## [1.0.4] - 2026-05-11
+## [Unreleased]
 
 ### Added
 - **Anthropic SSE transport wired into the live client path.** Anthropic-format requests now go through the SSE-based `/v1/messages` stream parser (while still returning only after the full response is assembled), which improves compatibility with gateways that only support streaming responses. Added integration coverage for the Faraday `on_data` path and kept session latency reporting in non-streaming mode until true incremental UI delivery lands.
 - **Configurable `anthropic_stream` model setting.** Anthropic-format models now expose an `anthropic_stream` switch through `AgentConfig`, CLI client construction, subagent model overlays, and the HTTP server model-test/build paths, with backward-compatible defaulting to `true` when the field is omitted.
 - **Thinking blocks preserved from Anthropic SSE responses.** The Anthropic stream parser now captures `thinking` / `thinking_delta` blocks in addition to normal text/tool-use blocks, so compatible gateways can expose reasoning data without corrupting the assistant text output.
+
+### Fixed
+- **Anthropic streaming usage/accounting now tolerates provider-specific SSE usage timing.** When compatible gateways report final `input_tokens` / cache usage on `message_delta` instead of `message_start`, the parser now uses the latest values so prompt/completion/total token counts remain correct.
+- **Anthropic tool-result formatting now accepts canonical `tool_call_id` / `result` payloads.** This fixes follow-up turns where tool results were provided in the newer canonical shape instead of the older `id` / `content` pair.
+
+## [1.0.5] - 2026-05-12
+
+### Added
 - **`persist-memory` subagent skill — agents can now save things to long-term memory.** New built-in `persist-memory` skill (forked subagent, auto-summarized, no web tools) handles file naming, topic merging, frontmatter, and size limits when writing to `~/.clacky/memories/`. The memory updater and skill manager now route persistence requests through this subagent for cleaner separation of concerns. Covered by new specs in `memory_updater_spec.rb` and `skill_manager_memories_spec.rb`.
 - **System prompts aligned with Claude Code behavioral rules.** Rewrote `base_prompt.md` and the coding/general system prompts with 6 new sections (Code Style, File Modification Rules, Response Style, Git Safety Protocol, Error Handling, Task Tracking). Internal benchmark on 5 tasks showed −40% response verbosity, −24% task duration, and qualitative improvement on 4/5 tasks with no regression in completion rate. (#96)
 - **Local image proxy via `GET /api/local-image` (C-5523).** New HTTP server endpoint exposes local images (e.g. screenshots written by tools) to the Web UI through a controlled proxy, with new `FileProcessor` utilities backing it. 86 new specs in `file_processor_spec.rb`. (#93)
@@ -36,8 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Ruby 4.0 added to CI matrix.** GitHub Actions main workflow now runs the test suite against Ruby 4.0 in addition to existing versions, catching forward-compat issues early.
 
 ### Fixed
-- **Anthropic streaming usage/accounting now tolerates provider-specific SSE usage timing.** When compatible gateways report final `input_tokens` / cache usage on `message_delta` instead of `message_start`, the parser now uses the latest values so prompt/completion/total token counts remain correct.
-- **Anthropic tool-result formatting now accepts canonical `tool_call_id` / `result` payloads.** This fixes follow-up turns where tool results were provided in the newer canonical shape instead of the older `id` / `content` pair.
 - **Session bar correctly attributes cost & skill reflection in subagents.** Fixed `cost_tracker` and `skill_reflector` so the parent session's bar no longer mis-counts subagent activity, giving accurate per-session cost and skill stats when forked subagents (like `persist-memory`) run.
 
 ### More
