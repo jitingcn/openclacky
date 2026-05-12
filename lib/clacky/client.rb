@@ -24,10 +24,11 @@ module Clacky
     # We generate both on first request per session and reuse them.
     attr_reader :cache_affinity_session_id, :cache_affinity_device_id, :cache_affinity_user_id
 
-    def initialize(api_key, base_url:, model:, anthropic_format: false, api_type: nil, stream: nil)
+    def initialize(api_key, base_url:, model:, anthropic_format: false, anthropic_stream: false, api_type: nil, stream: nil)
       @api_key = api_key
       @base_url = base_url
       @model = model
+      @anthropic_stream = anthropic_stream
       @stream = stream  # true = always stream, false = never stream, nil = auto
 
       # ── Cache affinity identity ──────────────────────────────────────────────
@@ -150,8 +151,13 @@ module Clacky
         ).to_json
         response = bedrock_connection.post(bedrock_endpoint(model)) { |r| r.body = body }
       elsif anthropic_format?
-        minimal_body = { model: model, max_tokens: 16,
-                         messages: [{ role: "user", content: "hi" }] }.to_json
+        minimal_body = if @anthropic_stream
+          { model: model, max_tokens: 16, stream: true,
+            messages: [{ role: "user", content: "hi" }] }.to_json
+        else
+          { model: model, max_tokens: 16,
+            messages: [{ role: "user", content: "hi" }] }.to_json
+        end
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = minimal_body }
       elsif @use_responses
         begin
@@ -217,16 +223,16 @@ module Clacky
         # Default to streaming first unless user explicitly disables it.
         # When stream is forced on (true), streaming failures propagate.
         # When stream is nil (auto), fall back to non-streaming gracefully.
-        unless @stream == false
+        unless @stream == false || @anthropic_stream == false
           begin
             return parse_simple_anthropic_stream_response(model, messages, max_tokens)
           rescue StandardError
-            raise if @stream == true
-            # @stream == nil: streaming failed, fall through to non-streaming below
+            raise if @stream == true || @anthropic_stream == true
+            # auto mode: streaming failed, fall through to non-streaming below
           end
         end
 
-        # Non-streaming path — either @stream == false or streaming fallback
+        # Non-streaming path — either explicitly disabled or streaming fallback
         body     = MessageFormat::Anthropic.build_request_body(messages, model, [], max_tokens, false)
         inject_cache_affinity!(body, :anthropic)
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
@@ -368,7 +374,11 @@ module Clacky
         elsif bedrock?
           send_bedrock_request(cloned, model, tools, max_tokens, caching_enabled)
         elsif anthropic_format?
-          send_anthropic_request(cloned, model, tools, max_tokens, caching_enabled)
+          if @anthropic_stream
+            send_anthropic_stream_request(cloned, model, tools, max_tokens, caching_enabled)
+          else
+            send_anthropic_request(cloned, model, tools, max_tokens, caching_enabled)
+          end
         else
           send_openai_request(cloned, model, tools, max_tokens, caching_enabled)
         end
@@ -547,15 +557,22 @@ module Clacky
       MessageFormat::Anthropic.parse_response(parsed_body)
     end
 
-    # Streaming variant of send_anthropic_request.  Reads the response body
+    def parse_simple_anthropic_response(response)
+      raise_error(response) unless response.status == 200
+      data = safe_json_parse(response.body, context: "LLM response")
+      (data["content"] || []).select { |b| b["type"] == "text" }.map { |b| b["text"] }.join("")
+    end
+
+    # Streaming variant of send_anthropic_request. Reads the response body
     # via Faraday's on_data callback, accumulates Anthropic SSE chunks, and
-    # parses them into canonical format.
+    # parses them into canonical format. The current caller still waits for
+    # the full stream to finish, so this remains logically non-streaming at
+    # the UI/agent boundary and latency[:streaming] stays false.
     def send_anthropic_stream_request(messages, model, tools, max_tokens, caching_enabled)
       # Apply cache_control to the message that marks the cache breakpoint
       messages = apply_message_caching(messages) if caching_enabled
 
       body = MessageFormat::Anthropic.build_stream_request_body(messages, model, tools, max_tokens, caching_enabled)
-      inject_cache_affinity!(body, :anthropic)
 
       chunks = []
       response = anthropic_connection.post(anthropic_messages_path) do |req|
@@ -566,22 +583,8 @@ module Clacky
         end
       end
 
+<<<<<<< HEAD
       # Handle errors: some providers require streaming via Responses API
-      if response.status == 400
-        error_body = begin
-          reconstructed = chunks.join
-          JSON.parse(reconstructed.empty? ? "{}" : reconstructed)
-        rescue
-          {}
-        end
-        error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
-        if error_msg.match?(/stream/i)
-          @use_responses = true
-          @openai_sdk_client ||= build_openai_client
-          return send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled)
-        end
-      end
-
       raise_error(response, chunks: chunks) unless response.status == 200
 
       # HTML response via stream means the endpoint doesn't support streaming
@@ -610,7 +613,6 @@ module Clacky
       body = MessageFormat::Anthropic.build_stream_request_body(
         messages, model, [], max_tokens, false
       )
-      inject_cache_affinity!(body, :anthropic)
 
       chunks = []
       response = anthropic_connection.post(anthropic_messages_path) do |req|

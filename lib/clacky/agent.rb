@@ -152,6 +152,7 @@ module Clacky
         base_url: @config.base_url,
         model: @config.model_name,
         anthropic_format: @config.anthropic_format?,
+        anthropic_stream: @config.anthropic_stream?,
         api_type: @config.api_type,
         stream: @config.stream
       )
@@ -1203,6 +1204,7 @@ module Clacky
         base_url: subagent_config.base_url,
         model: subagent_config.model_name,
         anthropic_format: subagent_config.anthropic_format?,
+        anthropic_stream: subagent_config.anthropic_stream?,
         api_type: subagent_config.api_type,
         stream: subagent_config.stream
       )

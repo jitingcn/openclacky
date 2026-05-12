@@ -165,6 +165,15 @@ RSpec.describe Clacky::Agent, "#fork_subagent" do
           .to eq("abs-claude-haiku-4-5")
       end
 
+      it "preserves anthropic_stream in the virtual lite overlay" do
+        config.models.first["anthropic_stream"] = false
+
+        subagent = agent.fork_subagent(model: "lite")
+        sub_config = subagent.instance_variable_get(:@config)
+
+        expect(sub_config.anthropic_stream?).to be false
+      end
+
       it "does NOT mutate the parent agent's current model" do
         original_opus_hash = config.models.first
         original_model_name = original_opus_hash["model"]

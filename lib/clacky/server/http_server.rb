@@ -2995,6 +2995,7 @@ module Clacky
             base_url:         body["base_url"].to_s,
             model:            model,
             anthropic_format: body["anthropic_format"] || false,
+            anthropic_stream: body.key?("anthropic_stream") ? body["anthropic_stream"] : true,
             api_type:         api_type_value,
             stream:           stream_value
           )
@@ -3199,6 +3200,7 @@ module Clacky
           base_url:         model_cfg["base_url"].to_s,
           model:            model_name,
           anthropic_format: model_cfg["anthropic_format"] || false,
+          anthropic_stream: model_cfg.key?("anthropic_stream") ? model_cfg["anthropic_stream"] : true,
           api_type:         model_cfg["api_type"],
           stream:           model_cfg.key?("stream") ? model_cfg["stream"] : nil
         )
@@ -3807,8 +3809,12 @@ module Clacky
           base_url: config.base_url,
           model: config.model_name,
           anthropic_format: config.anthropic_format?,
+<<<<<<< HEAD
           api_type: config.api_type,
           stream: config.stream
+=======
+          anthropic_stream: config.anthropic_stream?
+>>>>>>> 755670b (fix: complete anthropic streaming integration)
         )
 
         broadcaster = method(:broadcast)
