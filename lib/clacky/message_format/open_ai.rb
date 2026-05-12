@@ -44,10 +44,11 @@ module Clacky
       # @param vision_supported [Boolean] whether the target model accepts
       #   image_url content blocks (default true, conservative)
       # @return [Hash]
-      def build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true)
+      def build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, thinking_level: nil)
         api_messages = messages.map { |msg| normalize_message_content(msg, vision_supported: vision_supported) }
 
         body = { model: model, max_tokens: max_tokens, messages: api_messages }
+        apply_thinking_options!(body, thinking_level)
 
         if tools&.any?
           if caching_enabled
@@ -138,8 +139,8 @@ module Clacky
       # @param caching_enabled [Boolean]
       # @param vision_supported [Boolean]
       # @return [Hash]
-      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true)
-        body = build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: vision_supported)
+      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, thinking_level: nil)
+        body = build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: vision_supported, thinking_level: thinking_level)
         body[:stream] = true
         # Ask the API to include token usage in the final chunk (OpenAI >= 2024).
         # Older proxies silently ignore unknown fields, so this is safe.
@@ -218,8 +219,16 @@ module Clacky
           # Accumulate text content
           content << delta["content"] if delta["content"]
 
-          # Accumulate reasoning content (e.g. Kimi/Moonshot extended thinking)
+          # Accumulate reasoning content (DeepSeek/Kimi style field).
+          # Multiple delta field names exist across vendors:
+          #   - reasoning_content  (DeepSeek V4/V3/R1)
+          #   - reasoning          (OpenAI-compatible proxies)
+          #   - thinking           (alternative proxy convention)
+          #   - thought            (some Chinese vendor APIs)
           reasoning_content << delta["reasoning_content"] if delta["reasoning_content"]
+          reasoning_content << delta["reasoning"] if delta["reasoning"]
+          reasoning_content << delta["thinking"] if delta["thinking"]
+          reasoning_content << delta["thought"] if delta["thought"]
 
           # Accumulate tool calls (arrive incrementally by index)
           if delta["tool_calls"]
@@ -294,6 +303,10 @@ module Clacky
         usage         = data["usage"] || {}
         raw_api_usage = usage.dup
 
+        extracted_thinking = extract_leading_thinking_block(message["content"])
+        message_content = extracted_thinking[:content]
+        extracted_reasoning = extracted_thinking[:reasoning_content]
+
         usage_data = {
           prompt_tokens:     usage["prompt_tokens"],
           completion_tokens: usage["completion_tokens"],
@@ -311,15 +324,21 @@ module Clacky
         end
 
         result = {
-          content:       message["content"],
+          content:       message_content,
           tool_calls:    parse_tool_calls(message["tool_calls"]),
           finish_reason: data["choices"].first["finish_reason"],
           usage:         usage_data,
           raw_api_usage: raw_api_usage
         }
 
-        # Preserve reasoning_content (e.g. Kimi/Moonshot extended thinking)
-        result[:reasoning_content] = message["reasoning_content"] if message["reasoning_content"]
+        # Preserve reasoning_content (DeepSeek / Kimi / OpenAI-compatible thinking).
+        # Multiple field names exist across vendors:
+        #   - reasoning_content  (DeepSeek V4/V3/R1, some proxies)
+        #   - reasoning          (OpenAI-compatible proxies)
+        #   - thinking           (alternative proxy convention)
+        #   - thought            (some Chinese vendor APIs)
+        reasoning = message["reasoning_content"] || message["reasoning"] || message["thinking"] || message["thought"] || extracted_reasoning
+        result[:reasoning_content] = reasoning if reasoning
 
         result
       end
@@ -349,6 +368,15 @@ module Clacky
 
       # ── Private helpers ───────────────────────────────────────────────────────
 
+      private_class_method def self.apply_thinking_options!(body, thinking_level)
+        level = thinking_level.to_s.strip.downcase
+        return body if level.empty?
+
+        body[:reasoning_effort] = level
+        body[:reasoning] = { effort: level }
+        body
+      end
+
       private_class_method def self.parse_tool_calls(raw)
         return nil if raw.nil? || raw.empty?
 
@@ -361,6 +389,33 @@ module Clacky
 
           { id: call["id"], type: call["type"], name: name, arguments: arguments }
         end
+      end
+
+      private_class_method def self.extract_leading_thinking_block(content)
+        return { content: content, reasoning_content: nil } unless content.is_a?(String) && !content.empty?
+
+        normalized = content.sub(/\A\s+/, "")
+
+        if normalized.start_with?("<think>")
+          open_tag = "<think>"
+          close_tag = "</think>"
+        elsif normalized.start_with?("<thinking>")
+          open_tag = "<thinking>"
+          close_tag = "</thinking>"
+        else
+          return { content: content, reasoning_content: nil }
+        end
+
+        close_index = normalized.index(close_tag)
+        return { content: content, reasoning_content: nil } unless close_index
+
+        reasoning_content = normalized[open_tag.length...close_index].to_s.strip
+        remaining_content = normalized[(close_index + close_tag.length)..].to_s.sub(/\A\s+/, "")
+
+        {
+          content: remaining_content,
+          reasoning_content: reasoning_content
+        }
       end
 
       private_class_method def self.deep_clone(obj)

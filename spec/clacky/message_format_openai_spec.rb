@@ -118,14 +118,197 @@ RSpec.describe Clacky::MessageFormat::OpenAI do
       expect(body[:messages].last[:content]).to eq("Another string")
     end
 
-    it "preserves non-content message fields" do
+    it "adds reasoning hints when thinking_level is enabled" do
       messages = [
-        { role: "user", content: "Hello", task_id: 5, system_injected: true }
+        { role: "user", content: "Hello" }
       ]
 
-      body = described_class.build_request_body(messages, model, tools, max_tokens, false)
-      expect(body[:messages].first[:task_id]).to eq(5)
-      expect(body[:messages].first[:system_injected]).to eq(true)
+      body = described_class.build_request_body(
+        messages, model, tools, max_tokens, false,
+        thinking_level: "medium"
+      )
+      expect(body[:reasoning_effort]).to eq("medium")
+      expect(body[:reasoning]).to eq({ effort: "medium" })
+    end
+
+    it "parses reasoning from non-streaming responses" do
+      data = {
+        "choices" => [
+          {
+            "message" => {
+              "role" => "assistant",
+              "content" => "2",
+              "reasoning" => "先简单思考。"
+            },
+            "finish_reason" => "stop"
+          }
+        ],
+        "usage" => {
+          "prompt_tokens" => 3,
+          "completion_tokens" => 5,
+          "total_tokens" => 8
+        }
+      }
+
+      result = described_class.parse_response(data)
+      expect(result[:content]).to eq("2")
+      expect(result[:reasoning_content]).to eq("先简单思考。")
+    end
+
+    it "parses reasoning from thinking field (alternative vendor convention)" do
+      data = {
+        "choices" => [
+          {
+            "message" => {
+              "role" => "assistant",
+              "content" => "42",
+              "thinking" => "Let me calculate..."
+            },
+            "finish_reason" => "stop"
+          }
+        ],
+        "usage" => { "prompt_tokens" => 1, "completion_tokens" => 2, "total_tokens" => 3 }
+      }
+
+      result = described_class.parse_response(data)
+      expect(result[:content]).to eq("42")
+      expect(result[:reasoning_content]).to eq("Let me calculate...")
+    end
+
+    it "parses reasoning from thought field (Chinese vendor convention)" do
+      data = {
+        "choices" => [
+          {
+            "message" => {
+              "role" => "assistant",
+              "content" => "99",
+              "thought" => "这很简单"
+            },
+            "finish_reason" => "stop"
+          }
+        ],
+        "usage" => { "prompt_tokens" => 1, "completion_tokens" => 2, "total_tokens" => 3 }
+      }
+
+      result = described_class.parse_response(data)
+      expect(result[:content]).to eq("99")
+      expect(result[:reasoning_content]).to eq("这很简单")
+    end
+
+    it "parses leading <think> block from content as reasoning_content" do
+      data = {
+        "choices" => [
+          {
+            "message" => {
+              "role" => "assistant",
+              "content" => "<think>先想一下</think>\n\n最终答案"
+            },
+            "finish_reason" => "stop"
+          }
+        ],
+        "usage" => { "prompt_tokens" => 1, "completion_tokens" => 2, "total_tokens" => 3 }
+      }
+
+      result = described_class.parse_response(data)
+      expect(result[:reasoning_content]).to eq("先想一下")
+      expect(result[:content]).to eq("最终答案")
+    end
+
+    it "parses leading <thinking> block from content as reasoning_content" do
+      data = {
+        "choices" => [
+          {
+            "message" => {
+              "role" => "assistant",
+              "content" => "\n  <thinking>multi\nline\nthought</thinking>\nAnswer"
+            },
+            "finish_reason" => "stop"
+          }
+        ],
+        "usage" => { "prompt_tokens" => 1, "completion_tokens" => 2, "total_tokens" => 3 }
+      }
+
+      result = described_class.parse_response(data)
+      expect(result[:reasoning_content]).to eq("multi\nline\nthought")
+      expect(result[:content]).to eq("Answer")
+    end
+
+    it "does not extract think tags that are not at the beginning of content" do
+      data = {
+        "choices" => [
+          {
+            "message" => {
+              "role" => "assistant",
+              "content" => "前言\n<think>中间的想法</think>\n结尾"
+            },
+            "finish_reason" => "stop"
+          }
+        ],
+        "usage" => { "prompt_tokens" => 1, "completion_tokens" => 2, "total_tokens" => 3 }
+      }
+
+      result = described_class.parse_response(data)
+      expect(result[:reasoning_content]).to be_nil
+      expect(result[:content]).to eq("前言\n<think>中间的想法</think>\n结尾")
+    end
+
+    it "prefers explicit reasoning fields over extracted leading think block" do
+      data = {
+        "choices" => [
+          {
+            "message" => {
+              "role" => "assistant",
+              "content" => "<think>内联思考</think>\n答案",
+              "reasoning_content" => "显式思考"
+            },
+            "finish_reason" => "stop"
+          }
+        ],
+        "usage" => { "prompt_tokens" => 1, "completion_tokens" => 2, "total_tokens" => 3 }
+      }
+
+      result = described_class.parse_response(data)
+      expect(result[:reasoning_content]).to eq("显式思考")
+      expect(result[:content]).to eq("答案")
+    end
+
+    it "parses reasoning from streaming deltas" do
+      raw_chunks = [
+        "data: {\"choices\":[{\"delta\":{\"reasoning\":\"先\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"想\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"2\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5,\"total_tokens\":8}}\n\n",
+        "data: [DONE]\n\n"
+      ]
+
+      result = described_class.parse_stream_response(raw_chunks)
+      expect(result[:content]).to eq("2")
+      expect(result[:reasoning_content]).to eq("先想")
+    end
+
+    it "parses reasoning from thinking delta (alternative vendor convention)" do
+      raw_chunks = [
+        "data: {\"choices\":[{\"delta\":{\"thinking\":\"Let me\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"thinking\":\" think\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"42\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+        "data: [DONE]\n\n"
+      ]
+
+      result = described_class.parse_stream_response(raw_chunks)
+      expect(result[:content]).to eq("42")
+      expect(result[:reasoning_content]).to eq("Let me think")
+    end
+
+    it "parses reasoning from thought delta (Chinese vendor convention)" do
+      raw_chunks = [
+        "data: {\"choices\":[{\"delta\":{\"thought\":\"一步\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"thought\":\"一步来\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"99\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+        "data: [DONE]\n\n"
+      ]
+
+      result = described_class.parse_stream_response(raw_chunks)
+      expect(result[:content]).to eq("99")
+      expect(result[:reasoning_content]).to eq("一步一步来")
     end
 
     it "handles mixed content with multiple image_url blocks when vision_supported is false" do

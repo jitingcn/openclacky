@@ -76,7 +76,7 @@ module Clacky
       # @param previous_response_id [String, nil] previous response ID for
       #   multi-turn continuity
       # @return [Hash]
-      def build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, previous_response_id: nil)
+      def build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, previous_response_id: nil, thinking_level: nil)
         input_items = messages.flat_map { |msg| convert_message_to_input_items(msg, vision_supported: vision_supported, previous_response_id: previous_response_id) }
 
         body = {
@@ -85,6 +85,7 @@ module Clacky
           max_output_tokens: max_tokens,
           store: false
         }
+        apply_thinking_options!(body, thinking_level)
 
         body[:previous_response_id] = previous_response_id if previous_response_id
 
@@ -100,11 +101,12 @@ module Clacky
       # Same as build_request_body but with stream: true.
       #
       # @return [Hash]
-      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, previous_response_id: nil)
+      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, previous_response_id: nil, thinking_level: nil)
         body = build_request_body(
           messages, model, tools, max_tokens, caching_enabled,
           vision_supported: vision_supported,
-          previous_response_id: previous_response_id
+          previous_response_id: previous_response_id,
+          thinking_level: thinking_level
         )
         body[:stream] = true
         body
@@ -270,6 +272,7 @@ module Clacky
 
         # Extract text content from message-type items
         content_parts = []
+        reasoning_parts = []
         tool_calls    = []
 
         output_items.each do |item|
@@ -282,6 +285,8 @@ module Clacky
               case part["type"]
               when "output_text"
                 content_parts << part["text"]
+              when "reasoning", "reasoning_text", "summary_text"
+                reasoning_parts << part["text"] if part["text"]
               end
             end
           when "function_call"
@@ -295,6 +300,7 @@ module Clacky
         end
 
         content    = content_parts.empty? ? nil : content_parts.join
+        reasoning  = reasoning_parts.empty? ? nil : reasoning_parts.join
         tool_calls = nil if tool_calls.empty?
 
         usage = {
@@ -317,6 +323,7 @@ module Clacky
           usage:         usage,
           raw_api_usage: usage_data
         }
+        result[:reasoning_content] = reasoning if reasoning
         result
       end
 
@@ -366,7 +373,7 @@ module Clacky
           when "response.output_text.done"
             # Complete text delivered — we already accumulated via deltas
 
-          when "response.reasoning_text.delta"
+          when "response.reasoning.delta", "response.reasoning_text.delta"
             delta = event.dig(:data, "delta")
             reasoning << delta if delta
 
@@ -511,6 +518,16 @@ module Clacky
       end
 
       # ── Private helpers ───────────────────────────────────────────────────────
+
+      # Parse raw SSE body into an array of { type:, data: } hashes.
+      # Handles both standard (event: ...\ndata: ...) and simple (data: only) formats.
+      private def apply_thinking_options!(body, thinking_level)
+        level = thinking_level.to_s.strip.downcase
+        return body if level.empty?
+
+        body[:reasoning] = { effort: level }
+        body
+      end
 
       # Parse raw SSE body into an array of { type:, data: } hashes.
       # Handles both standard (event: ...\ndata: ...) and simple (data: only) formats.

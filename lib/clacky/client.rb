@@ -657,7 +657,8 @@ module Clacky
 
       body     = MessageFormat::OpenAI.build_request_body(
         messages, model, tools, max_tokens, caching_enabled,
-        vision_supported: @vision_supported
+        vision_supported: @vision_supported,
+        thinking_level: @config&.thinking_level
       )
       inject_cache_affinity!(body, :openai)
 
@@ -711,7 +712,8 @@ module Clacky
 
       body = MessageFormat::OpenAI.build_stream_request_body(
         messages, model, tools, max_tokens, caching_enabled,
-        vision_supported: @vision_supported
+        vision_supported: @vision_supported,
+        thinking_level: @config&.thinking_level
       )
       inject_cache_affinity!(body, :openai)
 
@@ -792,6 +794,7 @@ module Clacky
         store: false,
         prompt_cache_key: @cache_affinity_session_id
       }
+      apply_sdk_thinking_options!(params)
 
       if tools&.any?
         params[:tools] = tools.map { |t| MessageFormat::Responses.convert_tool_to_responses_format(t) }
@@ -836,6 +839,7 @@ module Clacky
       # avoids the extra (wasted) HTTP request.
       content_parts = []
       tool_calls    = []
+      reasoning_parts = []
       usage_data    = nil
       resp_id       = nil
 
@@ -848,6 +852,8 @@ module Clacky
           # Full text — authoritative, use this over accumulated deltas
           content_parts.clear
           content_parts << event.text if event.text
+        when :"response.reasoning.delta", :"response.reasoning_text.delta", :"response.reasoning_summary_text.delta"
+          reasoning_parts << event.delta if event.delta
         when :"response.output_item.done"
           # The completed output item has all fields including call_id.
           # Use this instead of function_call_arguments.done which lacks call_id.
@@ -871,13 +877,22 @@ module Clacky
         end
       end
 
-      build_canonical_from_stream(content_parts, tool_calls, usage_data, resp_id)
+      build_canonical_from_stream(content_parts, reasoning_parts, tool_calls, usage_data, resp_id)
+    end
+
+    private def apply_sdk_thinking_options!(params)
+      level = @config&.thinking_level.to_s.strip.downcase
+      return params if level.empty?
+
+      params[:reasoning] = { effort: level }
+      params
     end
 
     # Build the canonical response hash directly from accumulated stream data,
     # bypassing convert_sdk_response (which requires SDK typed objects).
-    private def build_canonical_from_stream(content_parts, tool_calls, usage_data, resp_id)
+    private def build_canonical_from_stream(content_parts, reasoning_parts, tool_calls, usage_data, resp_id)
       content    = content_parts.empty? ? nil : content_parts.join
+      reasoning  = reasoning_parts.empty? ? nil : reasoning_parts.join
       tool_calls = nil if tool_calls.empty?
       finish_reason = tool_calls && !tool_calls.empty? ? "tool_calls" : "stop"
 
@@ -912,7 +927,7 @@ module Clacky
       }
       raw_usage.merge!(raw_usage_h)
 
-      {
+      result = {
         id:               resp_id,
         content:          content,
         tool_calls:       tool_calls,
@@ -922,6 +937,8 @@ module Clacky
         model:            nil,
         response_object:  nil
       }
+      result[:reasoning_content] = reasoning if reasoning
+      result
     end
 
     # Convert an OpenAI::Responses::Response object to our canonical hash.
@@ -957,6 +974,8 @@ module Clacky
           # Extract reasoning text if present
           if item.respond_to?(:summary) && item.summary
             reasoning = item.summary.map { |s| s.text if s.respond_to?(:text) }.compact.join("\n")
+          elsif item.respond_to?(:content) && item.content
+            reasoning = Array(item.content).map { |part| part.text if part.respond_to?(:text) }.compact.join("\n")
           end
         end
       end

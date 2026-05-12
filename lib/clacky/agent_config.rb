@@ -159,7 +159,8 @@ module Clacky
                   :memory_update_enabled, :skill_evolution,
                   :compression_token_threshold, :compression_message_threshold,
                   :compression_max_recent_messages, :compression_target_tokens,
-                  :idle_compression_threshold, :idle_compression_delay
+                  :idle_compression_threshold, :idle_compression_delay,
+                  :thinking_level
 
     # Per-model compression override keys that can appear inside
     # a model entry's "compression_overrides" hash.
@@ -242,6 +243,7 @@ module Clacky
       @compression_target_tokens = options[:compression_target_tokens] || 10_000
       @idle_compression_threshold = options[:idle_compression_threshold] || 20_000
       @idle_compression_delay = options[:idle_compression_delay] || 180
+      @thinking_level = normalize_thinking_level(options[:thinking_level])
 
       # Memory and skill evolution configuration
       @memory_update_enabled = options[:memory_update_enabled].nil? ? true : options[:memory_update_enabled]
@@ -428,7 +430,7 @@ module Clacky
     # These map directly to AgentConfig accessors.
     CONFIG_SETTINGS_KEYS = %w[
       enable_compression enable_prompt_caching memory_update_enabled
-      skill_evolution
+      skill_evolution thinking_level
       compression_token_threshold compression_message_threshold
       compression_max_recent_messages compression_target_tokens
       idle_compression_threshold idle_compression_delay
@@ -446,6 +448,7 @@ module Clacky
         "enable_prompt_caching" => @enable_prompt_caching,
         "memory_update_enabled" => @memory_update_enabled,
         "skill_evolution" => @skill_evolution,
+        "thinking_level" => @thinking_level,
         "compression_token_threshold" => @compression_token_threshold,
         "compression_message_threshold" => @compression_message_threshold,
         "compression_max_recent_messages" => @compression_max_recent_messages,
@@ -456,14 +459,30 @@ module Clacky
       YAML.dump("settings" => settings, "models" => persistable_models)
     end
 
+    # Get global thinking level preference.
+    # Valid values: nil/"off", "low", "medium", "high".
+    def thinking_level
+      @thinking_level
+    end
+
+    # Set global thinking level preference.
+    def thinking_level=(value)
+      @thinking_level = normalize_thinking_level(value)
+    end
+
+
     # Check if any model is configured
     def models_configured?
       !@models.empty? && !current_model.nil?
     end
 
-    # NOTE: current_model is defined below (near the id-aware lookup path)
-    # — the earlier duplicate definition was removed. Ruby silently picks the
-    # last definition, but keeping only one avoids confusion.
+    private def normalize_thinking_level(value)
+      normalized = value.to_s.strip.downcase
+      return nil if normalized.empty? || normalized == "off"
+      return normalized if %w[low medium high].include?(normalized)
+
+      nil
+    end
 
     # Get model by index
     def get_model(index)
