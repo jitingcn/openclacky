@@ -583,7 +583,6 @@ module Clacky
         end
       end
 
-<<<<<<< HEAD
       # Handle errors: some providers require streaming via Responses API
       raise_error(response, chunks: chunks) unless response.status == 200
 

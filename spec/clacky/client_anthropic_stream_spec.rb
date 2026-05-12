@@ -9,13 +9,14 @@ RSpec.describe Clacky::Client, "Anthropic streaming transport" do
   let(:base_url) { "https://api.anthropic.com" }
   let(:model) { "claude-sonnet-4-6" }
 
-  def build_client(connection:, anthropic_stream: true)
+  def build_client(connection:, anthropic_stream: true, stream: nil)
     client = described_class.new(
       api_key,
       base_url: base_url,
       model: model,
       anthropic_format: true,
-      anthropic_stream: anthropic_stream
+      anthropic_stream: anthropic_stream,
+      stream: stream
     )
     client.instance_variable_set(:@anthropic_connection, connection)
     client
@@ -112,7 +113,7 @@ RSpec.describe Clacky::Client, "Anthropic streaming transport" do
       conn.adapter :test, test
     end
 
-    client = build_client(connection: connection, anthropic_stream: false)
+    client = build_client(connection: connection, anthropic_stream: false, stream: false)
     result = client.send_messages_with_tools(
       [{ role: "user", content: "Say hi" }],
       model: model,

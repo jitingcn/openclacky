@@ -3809,12 +3809,9 @@ module Clacky
           base_url: config.base_url,
           model: config.model_name,
           anthropic_format: config.anthropic_format?,
-<<<<<<< HEAD
+          anthropic_stream: config.anthropic_stream?,
           api_type: config.api_type,
           stream: config.stream
-=======
-          anthropic_stream: config.anthropic_stream?
->>>>>>> 755670b (fix: complete anthropic streaming integration)
         )
 
         broadcaster = method(:broadcast)
