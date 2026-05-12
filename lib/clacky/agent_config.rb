@@ -104,7 +104,8 @@ module Clacky
           "api_key" => default_api_key,
           "base_url" => default_base_url,
           "model" => default_model,
-          "anthropic_format" => default_anthropic_format
+          "anthropic_format" => default_anthropic_format,
+          "anthropic_stream" => true
         }.compact
       end
 
@@ -136,7 +137,8 @@ module Clacky
           "api_key" => lite_api_key,
           "base_url" => lite_base_url,
           "model" => lite_model,
-          "anthropic_format" => lite_anthropic_format
+          "anthropic_format" => lite_anthropic_format,
+          "anthropic_stream" => true
         }.compact
       end
     end
@@ -201,7 +203,7 @@ module Clacky
       # array. Used by fork_subagent's virtual-lite path so a forked subagent
       # can run on different credentials (e.g. Haiku instead of Opus) without
       # polluting the parent agent's shared @models hashes.
-      # Keys honored: "api_key", "base_url", "model", "anthropic_format".
+      # Keys honored: "api_key", "base_url", "model", "anthropic_format", "anthropic_stream".
       # @return [Hash, nil]
       @virtual_model_overlay = options[:virtual_model_overlay]
     end
@@ -543,19 +545,28 @@ module Clacky
       current_model&.dig("anthropic_format") || false
     end
 
+    # Check if should use Anthropic streaming transport for current model.
+    # Defaults to true when anthropic_format is enabled, but can be explicitly
+    # set to false to fall back to non-streaming /v1/messages requests.
+    def anthropic_stream?
+      val = current_model&.dig("anthropic_stream")
+      val.nil? ? true : val
+    end
+
     # Check if current model uses Bedrock Converse API (ABSK key prefix or abs- model prefix)
     def bedrock?
       Clacky::MessageFormat::Bedrock.bedrock_api_key?(api_key.to_s, model_name.to_s)
     end
 
     # Add a new model configuration
-    def add_model(model:, api_key:, base_url:, anthropic_format: false, type: nil)
+    def add_model(model:, api_key:, base_url:, anthropic_format: false, anthropic_stream: true, type: nil)
       @models << {
         "id" => SecureRandom.uuid,
         "api_key" => api_key,
         "base_url" => base_url,
         "model" => model,
         "anthropic_format" => anthropic_format,
+        "anthropic_stream" => anthropic_stream,
         "type" => type
       }.compact
     end
@@ -655,6 +666,7 @@ module Clacky
         "base_url"         => primary["base_url"],
         "model"            => lite_name,
         "anthropic_format" => primary["anthropic_format"] || false,
+        "anthropic_stream" => primary["anthropic_stream"].nil? ? true : primary["anthropic_stream"],
         "virtual"          => true  # marker: not a real @models entry
       }
     end
@@ -936,7 +948,8 @@ module Clacky
                 "api_key" => config["api_key"],
                 "base_url" => config["base_url"],
                 "model" => config["model_name"] || config["model"] || tier_name,
-                "anthropic_format" => config["anthropic_format"] || false
+                "anthropic_format" => config["anthropic_format"] || false,
+                "anthropic_stream" => config.key?("anthropic_stream") ? config["anthropic_stream"] : true
               }
               models << model_config
             elsif config.is_a?(String)
@@ -945,7 +958,8 @@ module Clacky
                 "api_key" => data["api_key"],
                 "base_url" => data["base_url"],
                 "model" => config,
-                "anthropic_format" => data["anthropic_format"] || false
+                "anthropic_format" => data["anthropic_format"] || false,
+                "anthropic_stream" => data.key?("anthropic_stream") ? data["anthropic_stream"] : true
               }
               models << model_config
             end
@@ -957,7 +971,8 @@ module Clacky
           "api_key" => data["api_key"],
           "base_url" => data["base_url"],
           "model" => data["model"] || CLAUDE_DEFAULT_MODEL,
-          "anthropic_format" => data["anthropic_format"] || false
+          "anthropic_format" => data["anthropic_format"] || false,
+          "anthropic_stream" => data.key?("anthropic_stream") ? data["anthropic_stream"] : true
         }
       end
 

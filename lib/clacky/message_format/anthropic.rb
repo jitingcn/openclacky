@@ -193,6 +193,8 @@ module Clacky
         usage_data    = {}
         cache_read    = 0
         cache_creation = 0
+        thinking      = +""
+        current_block_type = nil
 
         events.each do |event|
           event_type = event[:type]
@@ -209,6 +211,7 @@ module Clacky
 
           when "content_block_start"
             block = data["content_block"] || {}
+            current_block_type = block["type"]
             if block["type"] == "tool_use"
               current_tool = {
                 id:   block["id"],
@@ -222,6 +225,8 @@ module Clacky
             case delta["type"]
             when "text_delta"
               content << delta["text"] if delta["text"]
+            when "thinking_delta"
+              thinking << delta["thinking"] if delta["thinking"]
             when "input_json_delta"
               if current_tool
                 current_tool[:arguments] << delta["partial_json"] if delta["partial_json"]
@@ -233,6 +238,7 @@ module Clacky
               tool_calls << current_tool
               current_tool = nil
             end
+            current_block_type = nil
 
           when "message_delta"
             delta = data["delta"] || {}
@@ -243,9 +249,10 @@ module Clacky
                             else delta["stop_reason"]
                             end
             delta_usage = data["usage"] || {}
-            usage_data["output_tokens"] = delta_usage["output_tokens"]
-            cache_read += delta_usage["cache_read_input_tokens"].to_i
-            cache_creation += delta_usage["cache_creation_input_tokens"].to_i
+            usage_data["input_tokens"] = delta_usage["input_tokens"] if delta_usage.key?("input_tokens")
+            usage_data["output_tokens"] = delta_usage["output_tokens"] if delta_usage.key?("output_tokens")
+            cache_read = delta_usage["cache_read_input_tokens"].to_i if delta_usage.key?("cache_read_input_tokens")
+            cache_creation = delta_usage["cache_creation_input_tokens"].to_i if delta_usage.key?("cache_creation_input_tokens")
 
           when "message_stop"
             # End of stream — nothing to extract
@@ -282,7 +289,7 @@ module Clacky
         usage[:cache_read_input_tokens]     = cache_read     if cache_read     > 0
         usage[:cache_creation_input_tokens] = cache_creation if cache_creation > 0
 
-        {
+        result = {
           content:       content.empty? ? nil : content,
           tool_calls:    tool_calls,
           finish_reason: finish_reason,
@@ -292,6 +299,8 @@ module Clacky
             "cache_creation_input_tokens" => cache_creation
           )
         }
+        result[:thinking] = thinking unless thinking.empty?
+        result
       end
 
       # ── Tool result formatting ────────────────────────────────────────────────
@@ -300,14 +309,23 @@ module Clacky
       # Input:  response (canonical, has :tool_calls), tool_results array
       # Output: canonical messages: [{ role: "tool", tool_call_id:, content: }]
       def format_tool_results(response, tool_results)
-        results_map = tool_results.each_with_object({}) { |r, h| h[r[:id]] = r }
+        results_map = tool_results.each_with_object({}) do |result, map|
+          key = result[:id] || result[:tool_call_id]
+          map[key] = result if key
+        end
 
         response[:tool_calls].map do |tc|
           result = results_map[tc[:id]]
+          content = if result
+            result[:content] || result[:result] || result["content"] || result["result"]
+          else
+            { error: "Tool result missing" }
+          end
+
           {
             role: "tool",
             tool_call_id: tc[:id],
-            content: result ? result[:content] : { error: "Tool result missing" }.to_json
+            content: content.is_a?(String) ? content : content.to_json
           }
         end
       end

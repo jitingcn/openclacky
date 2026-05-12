@@ -73,6 +73,39 @@ RSpec.describe Clacky::AgentConfig do
           expect(config.models[1]["api_key"]).to eq("sk-key2")
         end
       end
+
+      it "defaults anthropic_stream to true when omitted" do
+        with_temp_config([
+          {
+            "model" => "claude-sonnet-4",
+            "api_key" => "sk-key1",
+            "base_url" => "https://api.test.com",
+            "anthropic_format" => true
+          }
+        ]) do |config_file|
+          config = described_class.load(config_file)
+
+          expect(config.models.first["anthropic_stream"]).to be_nil
+          expect(config.anthropic_stream?).to be true
+        end
+      end
+
+      it "preserves explicit anthropic_stream false from config" do
+        with_temp_config([
+          {
+            "model" => "claude-sonnet-4",
+            "api_key" => "sk-key1",
+            "base_url" => "https://api.test.com",
+            "anthropic_format" => true,
+            "anthropic_stream" => false
+          }
+        ]) do |config_file|
+          config = described_class.load(config_file)
+
+          expect(config.models.first["anthropic_stream"]).to be false
+          expect(config.anthropic_stream?).to be false
+        end
+      end
     end
 
     context "backward compatibility with old models: key format" do
@@ -191,6 +224,27 @@ RSpec.describe Clacky::AgentConfig do
         expect(loaded_data["models"].length).to eq(1)
         expect(loaded_data["models"][0]["api_key"]).to eq("sk-test")
         expect(loaded_data["models"][0]["model"]).to eq("test-model")
+      end
+    end
+
+    it "persists anthropic_stream when explicitly configured" do
+      with_temp_config do |config_file|
+        config = described_class.new(
+          models: [
+            {
+              "model" => "claude-sonnet-4",
+              "api_key" => "sk-test",
+              "base_url" => "https://api.test.com",
+              "anthropic_format" => true,
+              "anthropic_stream" => false
+            }
+          ]
+        )
+
+        config.save(config_file)
+
+        loaded_data = YAML.load_file(config_file)
+        expect(loaded_data["models"][0]["anthropic_stream"]).to be false
       end
     end
 

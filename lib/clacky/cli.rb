@@ -121,7 +121,8 @@ module Clacky
           agent_config.api_key,
           base_url: agent_config.base_url,
           model: agent_config.model_name,
-          anthropic_format: agent_config.anthropic_format?
+          anthropic_format: agent_config.anthropic_format?,
+          anthropic_stream: agent_config.anthropic_stream?
         )
       end
 

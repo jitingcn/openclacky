@@ -61,7 +61,8 @@ RSpec.describe "CLI client staleness regression (DSK → Opus → /clear)" do
         agent_config.api_key,
         base_url: agent_config.base_url,
         model: agent_config.model_name,
-        anthropic_format: agent_config.anthropic_format?
+        anthropic_format: agent_config.anthropic_format?,
+        anthropic_stream: agent_config.anthropic_stream?
       )
     end
   end
@@ -78,6 +79,14 @@ RSpec.describe "CLI client staleness regression (DSK → Opus → /clear)" do
       session_id:   Clacky::SessionManager.generate_id,
       source:       :manual
     )
+  end
+
+  it "passes anthropic_stream through the client factory" do
+    agent_config.models.first["anthropic_format"] = true
+    agent_config.models.first["anthropic_stream"] = false
+
+    client = client_factory.call
+    expect(client.instance_variable_get(:@anthropic_stream)).to eq(false)
   end
 
   it "starts on DSK with @use_bedrock=false (OpenAI-compat path)" do

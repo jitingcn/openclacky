@@ -3,6 +3,52 @@
 require "spec_helper"
 require "json"
 
+RSpec.describe Clacky::MessageFormat::Anthropic do
+  describe ".format_tool_results" do
+    it "accepts tool_call_id/result shaped tool results" do
+      response = {
+        tool_calls: [
+          { id: "call_123", type: "function", name: "echo_text", arguments: '{"text":"pong"}' }
+        ]
+      }
+      tool_results = [
+        { tool_call_id: "call_123", tool_name: "echo_text", result: { text: "pong" } }
+      ]
+
+      result = described_class.format_tool_results(response, tool_results)
+
+      expect(result).to eq([
+        {
+          role: "tool",
+          tool_call_id: "call_123",
+          content: '{"text":"pong"}'
+        }
+      ])
+    end
+
+    it "keeps existing id/content shaped tool results working" do
+      response = {
+        tool_calls: [
+          { id: "call_456", type: "function", name: "echo_text", arguments: '{"text":"pong"}' }
+        ]
+      }
+      tool_results = [
+        { id: "call_456", content: "pong" }
+      ]
+
+      result = described_class.format_tool_results(response, tool_results)
+
+      expect(result).to eq([
+        {
+          role: "tool",
+          tool_call_id: "call_456",
+          content: "pong"
+        }
+      ])
+    end
+  end
+end
+
 RSpec.describe Clacky::MessageFormat::Anthropic, "streaming" do
   # ── build_stream_request_body ──────────────────────────────────────────────
 
@@ -103,10 +149,11 @@ RSpec.describe Clacky::MessageFormat::Anthropic, "streaming" do
 
       result = described_class.parse_stream_response([sse])
 
-      # cache_read from message_start (500) + message_delta (100) = 600
-      expect(result[:usage][:cache_read_input_tokens]).to eq(600)
-      # prompt_tokens = raw_input(10) + cache_read(600) = 610
-      expect(result[:usage][:prompt_tokens]).to eq(610)
+      # Anthropic usually reports cache_read only once; if a delta repeats the
+      # field, the parser should prefer the latest value rather than double-count.
+      expect(result[:usage][:cache_read_input_tokens]).to eq(100)
+      # prompt_tokens = raw_input(10) + cache_read(100) = 110
+      expect(result[:usage][:prompt_tokens]).to eq(110)
     end
 
     it "returns nil content when no text deltas arrive" do
@@ -144,6 +191,62 @@ RSpec.describe Clacky::MessageFormat::Anthropic, "streaming" do
       expect(result[:tool_calls].length).to eq(2)
       expect(result[:tool_calls][0][:name]).to eq("tool_a")
       expect(result[:tool_calls][1][:name]).to eq("tool_b")
+    end
+
+    it "uses input_tokens from message_delta when providers report final usage there" do
+      sse = build_sse([
+        ["message_start", { type: "message_start", message: { id: "msg_7", usage: { input_tokens: 0, output_tokens: 0 } } }],
+        ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+        ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Mimi" } }],
+        ["content_block_stop", { type: "content_block_stop", index: 0 }],
+        ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 29, output_tokens: 3, cache_read_input_tokens: 0 } }],
+        ["message_stop", { type: "message_stop" }]
+      ])
+
+      result = described_class.parse_stream_response([sse])
+
+      expect(result[:content]).to eq("Mimi")
+      expect(result[:usage][:prompt_tokens]).to eq(29)
+      expect(result[:usage][:completion_tokens]).to eq(3)
+      expect(result[:usage][:total_tokens]).to eq(32)
+    end
+
+    it "captures thinking deltas without losing later text output" do
+      sse = build_sse([
+        ["message_start", { type: "message_start", message: { id: "msg_8", usage: { input_tokens: 20 } } }],
+        ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }],
+        ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Let me think. " } }],
+        ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Checking context." } }],
+        ["content_block_stop", { type: "content_block_stop", index: 0 }],
+        ["content_block_start", { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }],
+        ["content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Mimi" } }],
+        ["content_block_stop", { type: "content_block_stop", index: 1 }],
+        ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } }],
+        ["message_stop", { type: "message_stop" }]
+      ])
+
+      result = described_class.parse_stream_response([sse])
+
+      expect(result[:thinking]).to eq("Let me think. Checking context.")
+      expect(result[:content]).to eq("Mimi")
+      expect(result[:finish_reason]).to eq("stop")
+    end
+
+    it "captures thinking-only responses without fabricating text content" do
+      sse = build_sse([
+        ["message_start", { type: "message_start", message: { id: "msg_9", usage: { input_tokens: 12 } } }],
+        ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }],
+        ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Internal reasoning" } }],
+        ["content_block_stop", { type: "content_block_stop", index: 0 }],
+        ["message_delta", { type: "message_delta", delta: { stop_reason: "max_tokens" }, usage: { output_tokens: 5 } }],
+        ["message_stop", { type: "message_stop" }]
+      ])
+
+      result = described_class.parse_stream_response([sse])
+
+      expect(result[:thinking]).to eq("Internal reasoning")
+      expect(result[:content]).to be_nil
+      expect(result[:finish_reason]).to eq("length")
     end
 
     it "handles SSE without event: lines (data-only fallback)" do

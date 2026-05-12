@@ -8,10 +8,11 @@ module Clacky
     MAX_RETRIES = 10
     RETRY_DELAY = 5 # seconds
 
-    def initialize(api_key, base_url:, model:, anthropic_format: false)
+    def initialize(api_key, base_url:, model:, anthropic_format: false, anthropic_stream: false)
       @api_key = api_key
       @base_url = base_url
       @model = model
+      @anthropic_stream = anthropic_stream
       # Detect Bedrock: ABSK key prefix (native AWS) or abs- model prefix (Clacky AI proxy)
       @use_bedrock = MessageFormat::Bedrock.bedrock_api_key?(api_key, model)
 
@@ -60,8 +61,13 @@ module Clacky
         ).to_json
         response = bedrock_connection.post(bedrock_endpoint(model)) { |r| r.body = body }
       elsif anthropic_format?
-        minimal_body = { model: model, max_tokens: 16,
-                         messages: [{ role: "user", content: "hi" }] }.to_json
+        minimal_body = if @anthropic_stream
+          { model: model, max_tokens: 16, stream: true,
+            messages: [{ role: "user", content: "hi" }] }.to_json
+        else
+          { model: model, max_tokens: 16,
+            messages: [{ role: "user", content: "hi" }] }.to_json
+        end
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = minimal_body }
       else
         minimal_body = { model: model, max_tokens: 16,
@@ -91,9 +97,13 @@ module Clacky
         response = bedrock_connection.post(bedrock_endpoint(model)) { |r| r.body = body.to_json }
         parse_simple_bedrock_response(response)
       elsif anthropic_format?
-        body     = MessageFormat::Anthropic.build_request_body(messages, model, [], max_tokens, false)
-        response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
-        parse_simple_anthropic_response(response)
+        if @anthropic_stream
+          parse_simple_anthropic_stream_response(model, messages, max_tokens)
+        else
+          body     = MessageFormat::Anthropic.build_request_body(messages, model, [], max_tokens, false)
+          response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
+          parse_simple_anthropic_response(response)
+        end
       else
         body     = { model: model, max_tokens: max_tokens, messages: messages }
         response = openai_connection.post("chat/completions") { |r| r.body = body.to_json }
@@ -128,7 +138,11 @@ module Clacky
         if bedrock?
           send_bedrock_request(cloned, model, tools, max_tokens, caching_enabled)
         elsif anthropic_format?
-          send_anthropic_request(cloned, model, tools, max_tokens, caching_enabled)
+          if @anthropic_stream
+            send_anthropic_stream_request(cloned, model, tools, max_tokens, caching_enabled)
+          else
+            send_anthropic_request(cloned, model, tools, max_tokens, caching_enabled)
+          end
         else
           send_openai_request(cloned, model, tools, max_tokens, caching_enabled)
         end
@@ -235,12 +249,16 @@ module Clacky
       (data["content"] || []).select { |b| b["type"] == "text" }.map { |b| b["text"] }.join("")
     end
 
-    # Streaming variant of send_anthropic_request.  Reads the response body
+    # Streaming variant of send_anthropic_request. Reads the response body
     # via Faraday's on_data callback, accumulates Anthropic SSE chunks, and
-    # parses them into canonical format.
+    # parses them into canonical format. The current caller still waits for
+    # the full stream to finish, so this remains logically non-streaming at
+    # the UI/agent boundary and latency[:streaming] stays false.
     def send_anthropic_stream_request(messages, model, tools, max_tokens, caching_enabled)
+      # Apply cache_control to the message that marks the cache breakpoint
+      messages = apply_message_caching(messages) if caching_enabled
+
       body = MessageFormat::Anthropic.build_stream_request_body(messages, model, tools, max_tokens, caching_enabled)
-      inject_cache_affinity!(body, :anthropic)
 
       chunks = []
       response = anthropic_connection.post(anthropic_messages_path) do |req|
@@ -251,23 +269,8 @@ module Clacky
         end
       end
 
-      # Handle errors: some providers require streaming via Responses API
-      if response.status == 400
-        error_body = begin
-          reconstructed = chunks.join
-          JSON.parse(reconstructed.empty? ? "{}" : reconstructed)
-        rescue
-          {}
-        end
-        error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
-        if error_msg.match?(/stream/i)
-          @use_responses = true
-          return send_responses_stream_request(messages, model, tools, max_tokens, caching_enabled)
-        end
-      end
-
-      raise_error(response, chunks: chunks) unless response.status == 200
-      check_html_response(response, chunks: chunks)
+      raise_error(response) unless response.status == 200
+      check_html_response(response)
 
       MessageFormat::Anthropic.parse_stream_response(chunks)
     end
@@ -277,7 +280,6 @@ module Clacky
       body = MessageFormat::Anthropic.build_stream_request_body(
         messages, model, [], max_tokens, false
       )
-      inject_cache_affinity!(body, :anthropic)
 
       chunks = []
       response = anthropic_connection.post(anthropic_messages_path) do |req|
@@ -287,8 +289,8 @@ module Clacky
         end
       end
 
-      raise_error(response, chunks: chunks) unless response.status == 200
-      check_html_response(response, chunks: chunks)
+      raise_error(response) unless response.status == 200
+      check_html_response(response)
 
       parsed = MessageFormat::Anthropic.parse_stream_response(chunks)
       parsed[:content] || ""
