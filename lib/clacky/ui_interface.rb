@@ -7,7 +7,8 @@ module Clacky
     # === Output display ===
     # @param content [String] text portion of the assistant reply (file:// links stripped)
     # @param files   [Array<Hash>] extracted file refs: [{ name:, path:, inline: }]
-    def show_assistant_message(content, files:); end
+    # @param reasoning_content [String, nil] optional hidden/collapsible thinking content
+    def show_assistant_message(content, files:, reasoning_content: nil); end
     def show_tool_call(name, args); end
     def show_tool_result(result); end
     def show_tool_stdout(lines); end

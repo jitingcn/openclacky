@@ -376,7 +376,9 @@ module Clacky
 
       # Show assistant message
       # @param content [String] Message content
-      def show_assistant_message(content, files:)
+      def show_assistant_message(content, files:, reasoning_content: nil)
+        _ = reasoning_content
+
         # Filter out thinking tags from models like MiniMax M2.1 that use <think>...</think>
         filtered_content = filter_thinking_tags(content)
         return if filtered_content.nil? || filtered_content.strip.empty?
@@ -403,7 +405,6 @@ module Clacky
         filtered.strip
       end
 
-      # Show tool call
       # @param name [String] Tool name
       # @param args [String, Hash] Tool arguments (JSON string or Hash)
       def show_tool_call(name, args)

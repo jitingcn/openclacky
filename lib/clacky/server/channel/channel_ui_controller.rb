@@ -54,8 +54,9 @@ module Clacky
         send_text("[USER] #{content}")
       end
 
-      def show_assistant_message(content, files:)
+      def show_assistant_message(content, files:, reasoning_content: nil)
         flush_buffer
+        _ = reasoning_content
         Clacky::Logger.info("[ChannelUI] show_assistant_message files=#{files.size} content_len=#{content.to_s.length}")
         # Strip file:// markdown links from the text sent to IM channels —
         # the actual files are delivered via send_file() below, so the

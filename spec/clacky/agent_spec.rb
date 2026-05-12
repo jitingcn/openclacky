@@ -153,6 +153,18 @@ RSpec.describe Clacky::Agent do
 
   end
 
+  describe "reasoning content forwarding" do
+    let(:ui) { double("ui", show_assistant_message: nil, show_assistant_delta: nil) }
+    let(:agent_with_ui) { described_class.new(client, config, working_dir: Dir.pwd, ui: ui, profile: "coding", session_id: Clacky::SessionManager.generate_id, source: :manual) }
+
+    it "forwards reasoning_content to UI when emitting assistant message" do
+      agent_with_ui.send(:emit_assistant_message, "Final answer", reasoning_content: "Hidden chain")
+
+      expect(ui).to have_received(:show_assistant_message)
+        .with("Final answer", files: [], reasoning_content: "Hidden chain")
+    end
+  end
+
   describe "#add_hook" do
     it "allows adding hooks" do
       hook_called = false

@@ -27,6 +27,14 @@ RSpec.describe Clacky::UI2::ViewRenderer do
       expect(result).to include("World")
     end
 
+    it "does not render reasoning_content in the terminal UI" do
+      result = renderer.render_assistant_message("World", reasoning_content: "Step 1")
+      expect(result).to include("[<<]")
+      expect(result).to include("World")
+      expect(result).not_to include("Thinking")
+      expect(result).not_to include("Step 1")
+    end
+
     it "returns empty string for nil content" do
       result = renderer.render_assistant_message(nil)
       expect(result).to eq("")

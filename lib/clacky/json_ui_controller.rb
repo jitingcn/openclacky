@@ -28,11 +28,12 @@ module Clacky
 
     # === Output display ===
 
-    def show_assistant_message(content, files:)
-      return if (content.nil? || content.strip.empty?) && files.empty?
+    def show_assistant_message(content, files:, reasoning_content: nil)
+      return if (content.nil? || content.strip.empty?) && files.empty? && reasoning_content.to_s.strip.empty?
 
       data = { content: content.to_s }
       data[:files] = files if files.any?
+      data[:reasoning_content] = reasoning_content.to_s unless reasoning_content.to_s.strip.empty?
       emit("assistant_message", **data)
     end
 

@@ -32,9 +32,13 @@ module Clacky
       # Render an assistant message
       # @param content [String] Message content
       # @param timestamp [Time, nil] Optional timestamp
+      # @param reasoning_content [String, nil] Accepted for interface compatibility;
+      #   terminal UI intentionally ignores it for now.
       # @return [String] Rendered message
-      def render_assistant_message(content, timestamp: nil)
-        # Render markdown if content contains markdown syntax
+      def render_assistant_message(content, timestamp: nil, reasoning_content: nil)
+        _ = reasoning_content
+        return "" if content.nil? || content.to_s.empty?
+
         rendered_content = if MarkdownRenderer.markdown?(content)
           MarkdownRenderer.render(content)
         else
