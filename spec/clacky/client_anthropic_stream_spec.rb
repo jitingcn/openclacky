@@ -52,19 +52,22 @@ RSpec.describe Clacky::Client, "Anthropic streaming transport" do
     end
 
     client = build_client(connection: connection)
+    streamed_events = []
     result = client.send_messages_with_tools(
       [{ role: "user", content: "Say hi" }],
       model: model,
       tools: [],
       max_tokens: 64,
-      enable_caching: false
+      enable_caching: false,
+      on_stream_event: ->(event) { streamed_events << event }
     )
 
     expect(captured_body["stream"]).to eq(true)
     expect(result[:content]).to eq("Hello")
     expect(result[:finish_reason]).to eq("stop")
     expect(result.dig(:usage, :completion_tokens)).to eq(3)
-    expect(result.dig(:latency, :streaming)).to eq(false)
+    expect(result.dig(:latency, :streaming)).to eq(true)
+    expect(streamed_events).to include(hash_including(content_delta: "Hello"))
 
     test.verify_stubbed_calls
   end

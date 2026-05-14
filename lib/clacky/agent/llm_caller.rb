@@ -87,6 +87,26 @@ module Clacky
         # something else (e.g. tool schemas alone exceed the window) and we let
         # the error propagate.
         context_overflow_retry_attempted = false
+        streaming_started = false
+        llm_succeeded = false
+        reset_stream = lambda do
+          next unless streaming_started
+
+          @ui&.reset_assistant_stream
+          streaming_started = false
+        end
+        stream_callback = lambda do |event|
+          content_delta = event[:content_delta]
+          reasoning_delta = event[:reasoning_delta]
+          next if @suppress_assistant_streaming
+          next if content_delta.to_s.empty? && reasoning_delta.to_s.empty?
+
+          streaming_started = true
+          @ui&.show_assistant_delta(
+            content_delta: content_delta,
+            reasoning_delta: reasoning_delta
+          )
+        end
 
         begin
           begin
@@ -104,7 +124,8 @@ module Clacky
             tools: tools_to_send,
             max_tokens: @config.max_tokens,
             enable_caching: @config.enable_prompt_caching,
-            prompt_caching: @config.prompt_caching
+            prompt_caching: @config.prompt_caching,
+            on_stream_event: stream_callback
           )
 
           # Successful response — if we were probing, confirm primary is healthy.
@@ -144,10 +165,12 @@ module Clacky
 
           if @config.probing?
             handle_probe_failure
+            reset_stream.call
             retry
           end
 
           if retries <= max_retries
+            reset_stream.call
             inject_large_output_hint_if_first_timeout(e)
             @ui&.show_progress(
               "Response too slow (likely generating too much at once): #{e.message}",
@@ -168,6 +191,7 @@ module Clacky
           # Probing failure: primary still down — renew cooling-off and retry with fallback.
           if @config.probing?
             handle_probe_failure
+            reset_stream.call
             retry
           end
 
@@ -176,6 +200,7 @@ module Clacky
           # NOT inject the "break into steps" hint (the model did nothing wrong).
           # Just retry on the current model up to max_retries.
           if retries <= max_retries
+            reset_stream.call
             @ui&.show_progress(
               "Network failed: #{e.message}",
               progress_type: "retrying",
@@ -197,6 +222,7 @@ module Clacky
           # Probing failure: primary still down — renew cooling-off and retry with fallback.
           if @config.probing?
             handle_probe_failure
+            reset_stream.call
             retry
           end
 
@@ -209,10 +235,12 @@ module Clacky
           if retries <= current_max
             if retries == RETRIES_BEFORE_FALLBACK && !@config.fallback_active?
               if try_activate_fallback(current_model)
+                reset_stream.call
                 retries = 0
                 retry
               end
             end
+            reset_stream.call
             @ui&.show_progress(
               e.message,
               progress_type: "retrying",
@@ -250,6 +278,7 @@ module Clacky
             # Handles 99% of real overflow cases (newest message tipped the
             # request just past the window).
             if perform_context_overflow_compression(mode: :standard)
+              reset_stream.call
               retry
             end
 
@@ -263,6 +292,7 @@ module Clacky
               "[context-overflow] standard compression failed, escalating to aggressive mode"
             )
             if perform_context_overflow_compression(mode: :aggressive)
+              reset_stream.call
               retry
             end
 
@@ -292,6 +322,7 @@ module Clacky
               "[thinking-mode] retrying with forced reasoning_content padding " \
               "(model=#{@config.model_name.inspect} base_url=#{@config.base_url.inspect})"
             )
+            reset_stream.call
             retry
           end
           raise
@@ -344,6 +375,7 @@ module Clacky
           Clacky::Logger.warn("llm.response_log_failed", error: e.message)
         end
 
+        llm_succeeded = true
         response
         ensure
           # Close any "retrying" progress slot that was opened during the
@@ -359,6 +391,7 @@ module Clacky
           if retrying_progress_opened
             @ui&.show_progress(progress_type: "retrying", phase: "done")
           end
+          reset_stream.call unless llm_succeeded
         end
       end
 
@@ -463,6 +496,7 @@ module Clacky
           compression_message = compression_context[:compression_message]
           @history.append(compression_message)
 
+          @suppress_assistant_streaming = true
           response = call_llm  # recursive — guarded by @compressing_for_overflow
           handle_compression_response(response, compression_context)
           Clacky::Logger.info(
@@ -491,6 +525,7 @@ module Clacky
           )
           false
         ensure
+          @suppress_assistant_streaming = false
           @compressing_for_overflow = false
         end
       end

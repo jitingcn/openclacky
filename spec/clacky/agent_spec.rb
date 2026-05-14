@@ -154,7 +154,7 @@ RSpec.describe Clacky::Agent do
   end
 
   describe "reasoning content forwarding" do
-    let(:ui) { double("ui", show_assistant_message: nil, show_assistant_delta: nil) }
+    let(:ui) { double("ui").as_null_object }
     let(:agent_with_ui) { described_class.new(client, config, working_dir: Dir.pwd, ui: ui, profile: "coding", session_id: Clacky::SessionManager.generate_id, source: :manual) }
 
     it "forwards reasoning_content to UI when emitting assistant message" do
@@ -162,6 +162,22 @@ RSpec.describe Clacky::Agent do
 
       expect(ui).to have_received(:show_assistant_message)
         .with("Final answer", files: [], reasoning_content: "Hidden chain")
+    end
+
+    it "forwards streamed assistant deltas to the UI during think" do
+      allow(client).to receive(:send_messages_with_tools) do |_messages, **opts|
+        opts.fetch(:on_stream_event).call(content_delta: "Hel")
+        opts.fetch(:on_stream_event).call(reasoning_delta: "Hidden chain")
+        mock_api_response(content: "Hello", reasoning_content: "Hidden chain")
+      end
+
+      response = agent_with_ui.send(:think)
+
+      expect(response[:content]).to eq("Hello")
+      expect(ui).to have_received(:show_assistant_delta)
+        .with(content_delta: "Hel", reasoning_delta: nil)
+      expect(ui).to have_received(:show_assistant_delta)
+        .with(content_delta: nil, reasoning_delta: "Hidden chain")
     end
   end
 

@@ -9,6 +9,10 @@ module Clacky
     # @param files   [Array<Hash>] extracted file refs: [{ name:, path:, inline: }]
     # @param reasoning_content [String, nil] optional hidden/collapsible thinking content
     def show_assistant_message(content, files:, reasoning_content: nil); end
+    # @param content_delta [String, nil] streamed assistant text delta
+    # @param reasoning_delta [String, nil] streamed thinking/reasoning delta
+    def show_assistant_delta(content_delta: nil, reasoning_delta: nil); end
+    def reset_assistant_stream; end
     def show_tool_call(name, args); end
     def show_tool_result(result); end
     def show_tool_stdout(lines); end

@@ -92,9 +92,32 @@ module Clacky
         # blocked by browser security policy from loading file:// directly.
         # Channel subscribers receive the original content so they can deliver
         # local images as native attachments via send_file().
+        @live_assistant_stream = nil
         web_content = Clacky::Utils::FileProcessor.rewrite_local_image_urls(content.to_s)
         emit("assistant_message", content: web_content, files: files, reasoning_content: reasoning_content.to_s)
         forward_to_subscribers { |sub| sub.show_assistant_message(content, files: files, reasoning_content: reasoning_content) }
+      end
+
+      def show_assistant_delta(content_delta: nil, reasoning_delta: nil)
+        content = content_delta.to_s
+        reasoning = reasoning_delta.to_s
+        return if content.empty? && reasoning.empty?
+
+        @live_assistant_stream ||= { content: +"", reasoning_content: +"" }
+        @live_assistant_stream[:content] << content unless content.empty?
+        @live_assistant_stream[:reasoning_content] << reasoning unless reasoning.empty?
+
+        data = {}
+        data[:content_delta] = content unless content.empty?
+        data[:reasoning_delta] = reasoning unless reasoning.empty?
+        emit("assistant_delta", **data)
+      end
+
+      def reset_assistant_stream
+        return unless @live_assistant_stream
+
+        @live_assistant_stream = nil
+        emit("assistant_stream_reset")
       end
 
       def show_tool_call(name, args)
@@ -302,6 +325,15 @@ module Clacky
           started_at: started_at_ms
         )
 
+        if @live_assistant_stream
+          emit(
+            "assistant_delta",
+            content: @live_assistant_stream[:content],
+            reasoning_content: @live_assistant_stream[:reasoning_content],
+            replace: true
+          )
+        end
+
         buf = @live_stdout_buffer
         emit("tool_stdout", lines: buf) if buf && !buf.empty?
       end
@@ -335,6 +367,10 @@ module Clacky
           emit("progress", phase: "done", status: "stop")
           @live_progress_state = nil
           @progress_start_time = nil
+        end
+        if @live_assistant_stream
+          emit("assistant_stream_reset")
+          @live_assistant_stream = nil
         end
         emit("session_update", status: "idle")
         forward_to_subscribers { |sub| sub.set_idle_status }

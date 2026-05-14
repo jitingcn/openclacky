@@ -635,16 +635,19 @@ module Clacky
         begin
           if @ui
             @ui.with_progress(message: "Compressing message history...", style: :quiet) do |handle|
+              @suppress_assistant_streaming = true
               response = call_llm
               handle_compression_response(response, compression_context, progress: handle)
               compression_handled = true
             end
           else
+            @suppress_assistant_streaming = true
             response = call_llm
             handle_compression_response(response, compression_context)
             compression_handled = true
           end
         ensure
+          @suppress_assistant_streaming = false
           # If interrupted or failed, roll back the speculative compression message
           # so it doesn't pollute future conversation turns.
           unless compression_handled
@@ -679,6 +682,7 @@ module Clacky
 
         if @task_truncation_count >= 3
           # Too many truncations - task is too complex
+          @ui&.reset_assistant_stream
           @ui&.show_progress(phase: "done")
           @ui&.show_error("Response truncated multiple times. Task is too complex.")
 
@@ -734,6 +738,7 @@ module Clacky
 
         # Close the current spinner so the warning appears cleanly;
         # the recursive think() call below will reopen a new one.
+        @ui&.reset_assistant_stream
         @ui&.show_progress(phase: "done")
         @ui&.show_warning("Response truncated (#{@task_truncation_count}/3). Retrying with smaller steps...")
 

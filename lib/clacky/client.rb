@@ -8,6 +8,7 @@ require "json"
 require "digest"
 require "securerandom"
 require "openai"
+require "cgi"
 
 module Clacky
   class Client
@@ -363,26 +364,42 @@ module Clacky
     #   signal metric — see docs).  When we add full streaming support (with
     #   incremental UI), this same `ttft_ms` field will start carrying the
     #   *actual* first-token latency without any schema change.
-    def send_messages_with_tools(messages, model:, tools:, max_tokens:, enable_caching: false, prompt_caching: nil)
+    def send_messages_with_tools(messages, model:, tools:, max_tokens:, enable_caching: false, prompt_caching: nil, on_stream_event: nil)
       caching_enabled = enable_caching && supports_prompt_caching?(model, prompt_caching)
       cloned = deep_clone(messages)
 
       t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      streaming_observed = false
+      first_stream_delta_ms = nil
+      stream_observer = lambda do |event|
+        content_delta = event[:content_delta].to_s
+        reasoning_delta = event[:reasoning_delta].to_s
+        next if content_delta.empty? && reasoning_delta.empty?
+
+        unless streaming_observed
+          first_stream_delta_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0) * 1000).round
+          streaming_observed = true
+        end
+
+        on_stream_event&.call(event)
+      end
+
       response =
         if @use_responses
-          send_sdk_responses_request(cloned, model, tools, max_tokens, caching_enabled)
+          send_sdk_responses_request(cloned, model, tools, max_tokens, caching_enabled, on_stream_event: stream_observer)
         elsif bedrock?
           send_bedrock_request(cloned, model, tools, max_tokens, caching_enabled)
         elsif anthropic_format?
           if @anthropic_stream
-            send_anthropic_stream_request(cloned, model, tools, max_tokens, caching_enabled)
+            send_anthropic_stream_request(cloned, model, tools, max_tokens, caching_enabled, on_stream_event: stream_observer)
           else
-            send_anthropic_request(cloned, model, tools, max_tokens, caching_enabled)
+            send_anthropic_request(cloned, model, tools, max_tokens, caching_enabled, on_stream_event: stream_observer)
           end
         else
-          send_openai_request(cloned, model, tools, max_tokens, caching_enabled)
+          send_openai_request(cloned, model, tools, max_tokens, caching_enabled, on_stream_event: stream_observer)
         end
       t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      response[:reasoning_content] ||= response.delete(:thinking) if response[:thinking]
 
       duration_ms = ((t1 - t0) * 1000).round
       # Throughput is only meaningful with a reasonable output size; below ~10
@@ -393,13 +410,13 @@ module Clacky
       tps = (output_tokens >= 10 && duration_ms > 0) ? (output_tokens * 1000.0 / duration_ms).round(1) : nil
 
       response[:latency] = {
-        ttft_ms:     duration_ms,      # non-streaming: TTFT == full duration
+        ttft_ms:     streaming_observed ? (first_stream_delta_ms || duration_ms) : duration_ms,
         duration_ms: duration_ms,
         output_tokens: output_tokens,
         tps:         tps,
         model:       model,
         measured_at: Time.now.to_f,
-        streaming:   false              # future flag — true when we migrate
+        streaming:   streaming_observed
       }
       response
     end
@@ -504,7 +521,7 @@ module Clacky
 
     # ── Anthropic request / response ──────────────────────────────────────────
 
-    def send_anthropic_request(messages, model, tools, max_tokens, caching_enabled)
+    def send_anthropic_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: nil)
       # Apply cache_control to the message that marks the cache breakpoint
       messages = apply_message_caching(messages) if caching_enabled
 
@@ -513,7 +530,7 @@ module Clacky
       # When stream is nil (auto), fall back to non-streaming gracefully.
       unless @stream == false
         begin
-          return send_anthropic_stream_request(messages, model, tools, max_tokens, caching_enabled)
+          return send_anthropic_stream_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: on_stream_event)
         rescue StandardError
           raise if @stream == true
           # @stream == nil: streaming failed, fall through to non-streaming below
@@ -540,7 +557,7 @@ module Clacky
         if error_msg.match?(/stream/i)
           @use_responses = true
           @openai_sdk_client ||= build_openai_client
-          return send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled)
+          return send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: on_stream_event)
         end
       end
 
@@ -548,7 +565,7 @@ module Clacky
       if html_response?(response)
         @use_responses = true
         @openai_sdk_client ||= build_openai_client
-        return send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled)
+        return send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: on_stream_event)
       end
 
       raise_error(response) unless response.status == 200
@@ -568,7 +585,7 @@ module Clacky
     # parses them into canonical format. The current caller still waits for
     # the full stream to finish, so this remains logically non-streaming at
     # the UI/agent boundary and latency[:streaming] stays false.
-    def send_anthropic_stream_request(messages, model, tools, max_tokens, caching_enabled)
+    def send_anthropic_stream_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: nil)
       # Apply cache_control to the message that marks the cache breakpoint
       messages = apply_message_caching(messages) if caching_enabled
 
@@ -576,11 +593,13 @@ module Clacky
       inject_cache_affinity!(body, :anthropic)
 
       chunks = []
+      sse_buffer = +""
       response = anthropic_connection.post(anthropic_messages_path) do |req|
         req.body = body.to_json
         req.headers["x-client-request-id"] = SecureRandom.uuid
         req.options.on_data = proc do |chunk, _bytes, _env|
           chunks << chunk if chunk
+          observe_anthropic_stream_chunk(chunk, sse_buffer, on_stream_event) if chunk
         end
       end
 
@@ -638,7 +657,7 @@ module Clacky
 
     # ── OpenAI request / response ─────────────────────────────────────────────
 
-    def send_openai_request(messages, model, tools, max_tokens, caching_enabled)
+    def send_openai_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: nil)
       # Apply cache_control markers to messages when caching is enabled.
       # OpenRouter proxies Claude with the same cache_control field convention as Anthropic direct.
       messages = apply_message_caching(messages) if caching_enabled
@@ -648,7 +667,7 @@ module Clacky
       # When stream is nil (auto), we fall back to non-streaming gracefully.
       unless @stream == false
         begin
-          return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+          return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: on_stream_event)
         rescue StandardError
           raise if @stream == true
           # @stream == nil: streaming failed, fall through to non-streaming below
@@ -670,7 +689,7 @@ module Clacky
       rescue Faraday::TimeoutError
         # When stream: false (forced), don't fallback — propagate the error
         raise if @stream == false
-        return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+        return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: on_stream_event)
       end
 
       # Detect providers that return "Stream must be set to true" (e.g. DeepSeek
@@ -684,7 +703,7 @@ module Clacky
         error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
         if error_msg.match?(/stream/i)
           raise RetryableError, "Provider requires streaming but stream is forced off" if @stream == false
-          return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+          return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: on_stream_event)
         end
       end
 
@@ -694,7 +713,7 @@ module Clacky
       # fallback to streaming instead of getting stuck in a retry loop.
       if html_response?(response)
         raise RetryableError, "Provider requires streaming but stream is forced off" if @stream == false
-        return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+        return send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: on_stream_event)
       end
       
       parsed_body = safe_json_parse(response.body, context: "LLM response")
@@ -705,7 +724,7 @@ module Clacky
     # stream: true (e.g. DeepSeek V4).  Reads the response body via Faraday's
     # on_data callback, accumulates SSE chunks, and parses them into the same
     # canonical format as the non-streaming path.
-    def send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled)
+    def send_openai_stream_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: nil)
       # Apply cache_control markers to messages when caching is enabled.
       # OpenRouter proxies Claude with the same cache_control field convention as Anthropic direct.
       messages = apply_message_caching(messages) if caching_enabled
@@ -718,10 +737,12 @@ module Clacky
       inject_cache_affinity!(body, :openai)
 
       chunks = []
+      sse_buffer = +""
       response = openai_connection.post("chat/completions") do |req|
         req.body = body.to_json
         req.options.on_data = proc do |chunk, _bytes, _env|
           chunks << chunk if chunk
+          observe_openai_stream_chunk(chunk, sse_buffer, on_stream_event) if chunk
         end
       end
 
@@ -782,7 +803,7 @@ module Clacky
     # Strategy: try non-streaming first (SDK's create).  Some proxies
     # (e.g. 211server) require stream: true and reject non-streaming with
     # 400.  When that happens, fall back to SDK's stream() + until_done.
-    def send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled)
+    def send_sdk_responses_request(messages, model, tools, max_tokens, caching_enabled, on_stream_event: nil)
       input_items = MessageFormat::Responses.build_input_items(
         messages, vision_supported: @vision_supported
       )
@@ -805,7 +826,7 @@ module Clacky
         # When stream: true is configured (e.g. streaming-only proxies),
         # skip the non-streaming create() attempt entirely.
         if @stream
-          result = stream_responses_via_sdk(params)
+          result = stream_responses_via_sdk(params, on_stream_event: on_stream_event)
           result.is_a?(Hash) ? result : convert_sdk_response(result)
         else
           sdk_resp = @openai_sdk_client.responses.create(params)
@@ -814,7 +835,7 @@ module Clacky
       rescue OpenAI::Errors::BadRequestError => e
         # Proxy requires streaming — fall back to SDK's stream_raw
         if e.message.include?("stream") || e.message.include?("Stream")
-          result = stream_responses_via_sdk(params)
+          result = stream_responses_via_sdk(params, on_stream_event: on_stream_event)
           result.is_a?(Hash) ? result : convert_sdk_response(result)
         else
           raise map_sdk_error(e)
@@ -831,7 +852,7 @@ module Clacky
     # which means SDK's ResponseStreamState never finalizes and get_final_response
     # returns an empty output.  In that case, we manually accumulate the text
     # and tool calls from the raw stream events.
-    private def stream_responses_via_sdk(params)
+    private def stream_responses_via_sdk(params, on_stream_event: nil)
       # Always use stream_raw directly — don't waste an API call on stream()
       # + get_final_response first.  Some proxies send `response.complete`
       # instead of `response.completed`, so SDK's ResponseStreamState never
@@ -847,13 +868,19 @@ module Clacky
       raw_stream.each do |event|
         case event.type
         when :"response.output_text.delta"
-          content_parts << event.delta if event.delta
+          if event.delta
+            content_parts << event.delta
+            emit_stream_event(on_stream_event, content_delta: event.delta)
+          end
         when :"response.output_text.done"
           # Full text — authoritative, use this over accumulated deltas
           content_parts.clear
           content_parts << event.text if event.text
         when :"response.reasoning.delta", :"response.reasoning_text.delta", :"response.reasoning_summary_text.delta"
-          reasoning_parts << event.delta if event.delta
+          if event.delta
+            reasoning_parts << event.delta
+            emit_stream_event(on_stream_event, reasoning_delta: event.delta)
+          end
         when :"response.output_item.done"
           # The completed output item has all fields including call_id.
           # Use this instead of function_call_arguments.done which lacks call_id.
@@ -939,6 +966,96 @@ module Clacky
       }
       result[:reasoning_content] = reasoning if reasoning
       result
+    end
+
+    private def emit_stream_event(observer, content_delta: nil, reasoning_delta: nil)
+      return unless observer
+
+      content = content_delta.to_s
+      reasoning = reasoning_delta.to_s
+      return if content.empty? && reasoning.empty?
+
+      observer.call(
+        content_delta: content.empty? ? nil : content,
+        reasoning_delta: reasoning.empty? ? nil : reasoning
+      )
+    end
+
+    private def observe_openai_stream_chunk(chunk, buffer, observer)
+      consume_sse_events(chunk, buffer) do |raw_event|
+        data_lines = raw_event.lines.filter_map do |line|
+          stripped = line.chomp
+          next if stripped.empty? || stripped.start_with?(":")
+          next unless stripped.start_with?("data:")
+
+          stripped.sub(/\Adata:\s?/, "")
+        end
+        next if data_lines.empty?
+
+        data_str = data_lines.join("\n")
+        next if data_str.strip == "[DONE]"
+
+        parsed = begin
+          JSON.parse(data_str)
+        rescue JSON::ParserError
+          nil
+        end
+        next unless parsed.is_a?(Hash)
+
+        delta = parsed.dig("choices", 0, "delta") || {}
+        emit_stream_event(
+          observer,
+          content_delta: delta["content"],
+          reasoning_delta: delta["reasoning_content"] || delta["reasoning"] || delta["thinking"] || delta["thought"]
+        )
+      end
+    end
+
+    private def observe_anthropic_stream_chunk(chunk, buffer, observer)
+      consume_sse_events(chunk, buffer) do |raw_event|
+        event_type = nil
+        data_lines = []
+
+        raw_event.each_line do |line|
+          stripped = line.chomp
+          next if stripped.empty? || stripped.start_with?(":")
+
+          if stripped.start_with?("event:")
+            event_type = stripped.sub(/\Aevent:\s?/, "")
+          elsif stripped.start_with?("data:")
+            data_lines << stripped.sub(/\Adata:\s?/, "")
+          end
+        end
+        next if data_lines.empty?
+
+        data = begin
+          JSON.parse(data_lines.join("\n"))
+        rescue JSON::ParserError
+          nil
+        end
+        next unless data.is_a?(Hash)
+
+        type = event_type || data["type"]
+        next unless type == "content_block_delta"
+
+        delta = data["delta"] || {}
+        content_delta = delta["type"] == "text_delta" ? delta["text"] : nil
+        reasoning_delta = delta["type"] == "thinking_delta" ? delta["thinking"] : nil
+        emit_stream_event(observer, content_delta: content_delta, reasoning_delta: reasoning_delta)
+      end
+    end
+
+    private def consume_sse_events(chunk, buffer)
+      return unless block_given?
+
+      buffer << chunk.to_s.gsub("\r\n", "\n")
+      while (separator_index = buffer.index("\n\n"))
+        raw_event = buffer.slice!(0, separator_index + 2)
+        raw_event.sub!(/\n\n\z/, "")
+        next if raw_event.empty?
+
+        yield raw_event
+      end
     end
 
     # Convert an OpenAI::Responses::Response object to our canonical hash.
