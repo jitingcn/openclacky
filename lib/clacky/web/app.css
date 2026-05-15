@@ -1729,6 +1729,20 @@ body {
 .msg-assistant img { max-width: 100%; height: auto; border-radius: 4px; }
 .msg-assistant strong { font-weight: 600; color: var(--color-text-primary); }
 .msg-assistant em { font-style: italic; color: var(--color-text-secondary); }
+.clacky-math-source--block,
+.msg-assistant mjx-container[display="true"] {
+  display: block;
+  margin: 0.65em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  max-width: 100%;
+}
+.msg-assistant mjx-container {
+  max-width: 100%;
+}
+.msg-assistant mjx-container[jax="CHTML"][display="true"] > mjx-math {
+  margin: 0 auto;
+}
 .msg-tool      { background: var(--color-bg-primary); border: 1px solid var(--color-border-primary); font-family: monospace; font-size: 12px; color: var(--color-text-secondary); align-self: flex-start; }
 .msg-info      { color: var(--color-text-secondary); font-size: 12px; align-self: center; font-style: italic; }
 
@@ -2016,6 +2030,12 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
   font-style: italic;
+}
+.thinking-body mjx-container {
+  color: inherit;
+}
+.thinking-body mjx-container[display="true"] {
+  margin: 0.5em 0;
 }
 
 /* Inline image thumbnails inside user message bubbles */
@@ -6659,6 +6679,16 @@ body.setup-mode[data-theme="dark"] {
 
 .profile-markdown strong { font-weight: 600; }
 .profile-markdown em     { font-style: italic; }
+.profile-markdown mjx-container,
+.profile-markdown .clacky-math-source--block {
+  max-width: 100%;
+}
+.profile-markdown mjx-container[display="true"] {
+  display: block;
+  overflow-x: auto;
+  overflow-y: hidden;
+  margin: 10px 0;
+}
 
 /* ── Memories list (cards) ───────────────────────────────────────────── */
 .memories-summary {
@@ -7680,5 +7710,4 @@ body.setup-mode[data-theme="dark"] {
   flex-direction: column;
   gap: 10px;
 }
-
 
