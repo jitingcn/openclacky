@@ -9,6 +9,17 @@ require "digest"
 require "securerandom"
 require "openai"
 require "cgi"
+require "uri"
+
+# Ruby 4.0 removed CGI.parse, but openai-ruby 0.61.0 still calls it when
+# normalizing base URLs. Recreate the legacy API shape expected by the gem.
+unless CGI.respond_to?(:parse)
+  def CGI.parse(query)
+    URI.decode_www_form(query.to_s).each_with_object(Hash.new { |h, k| h[k] = [] }) do |(key, value), params|
+      params[key] << value
+    end
+  end
+end
 
 module Clacky
   class Client
