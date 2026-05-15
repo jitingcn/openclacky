@@ -154,7 +154,10 @@ module Clacky
         anthropic_format: @config.anthropic_format?,
         anthropic_stream: @config.anthropic_stream?,
         api_type: @config.api_type,
-        stream: @config.stream
+        stream: @config.stream,
+        thinking_enabled: @config.thinking_enabled,
+        reasoning_effort: @config.reasoning_effort,
+        raw_response_logging: @config.raw_response_logging_enabled
       )
       # Update message compressor with new client and model
       @message_compressor = MessageCompressor.new(@client, model: current_model)
@@ -722,6 +725,8 @@ module Clacky
         # other synthetic assistant messages in the history with an empty
         # reasoning_content automatically (see message_history.rb).
         truncated_msg[:reasoning_content] = response[:reasoning_content] if response[:reasoning_content]
+        truncated_msg[:thinking_blocks] = response[:thinking_blocks] if response[:thinking_blocks]
+        truncated_msg[:raw_response_debug] = response[:raw_response_debug] if response[:raw_response_debug]
         @history.append(truncated_msg)
 
         # Insert system message to guide LLM to retry with smaller steps
@@ -779,6 +784,8 @@ module Clacky
       # reasoning_content so every outgoing payload satisfies the provider's
       # "reasoning_content must be passed back" contract.
       msg[:reasoning_content] = response[:reasoning_content] if response[:reasoning_content]
+      msg[:thinking_blocks] = response[:thinking_blocks] if response[:thinking_blocks]
+      msg[:raw_response_debug] = response[:raw_response_debug] if response[:raw_response_debug]
       @history.append(msg)
 
       # Close the thinking spinner before returning. The caller (run loop)
@@ -1182,7 +1189,9 @@ module Clacky
                 "api_key"          => lite_cfg["api_key"],
                 "base_url"         => lite_cfg["base_url"],
                 "model"            => lite_cfg["model"],
-                "anthropic_format" => lite_cfg["anthropic_format"]
+                "anthropic_format" => lite_cfg["anthropic_format"],
+                "thinking_enabled" => lite_cfg["thinking_enabled"],
+                "reasoning_effort" => lite_cfg["reasoning_effort"]
               )
             elsif lite_cfg["id"]
               # Explicit user-configured lite (from CLACKY_LITE_* env): a
@@ -1211,7 +1220,10 @@ module Clacky
         anthropic_format: subagent_config.anthropic_format?,
         anthropic_stream: subagent_config.anthropic_stream?,
         api_type: subagent_config.api_type,
-        stream: subagent_config.stream
+        stream: subagent_config.stream,
+        thinking_enabled: subagent_config.thinking_enabled,
+        reasoning_effort: subagent_config.reasoning_effort,
+        raw_response_logging: subagent_config.raw_response_logging_enabled
       )
 
       # Create subagent (reuses all tools from parent, inherits agent profile from parent)

@@ -179,6 +179,27 @@ RSpec.describe Clacky::Agent do
       expect(ui).to have_received(:show_assistant_delta)
         .with(content_delta: nil, reasoning_delta: "Hidden chain")
     end
+
+    it "persists raw_response_debug on assistant history messages" do
+      allow(client).to receive(:send_messages_with_tools)
+        .and_return(
+          mock_api_response(content: "Hello").merge(
+            raw_response_debug: {
+              transport: "openai-chat-completions",
+              response_body: "data: ...\n\n"
+            }
+          )
+        )
+
+      result = agent.run("Say hi")
+
+      expect(result[:status]).to eq(:success)
+      assistant = agent.history.to_a.reverse.find { |msg| msg[:role] == "assistant" }
+      expect(assistant[:raw_response_debug]).to include(
+        transport: "openai-chat-completions",
+        response_body: "data: ...\n\n"
+      )
+    end
   end
 
   describe "#add_hook" do

@@ -48,7 +48,7 @@ module Clacky
       # @param max_tokens [Integer]
       # @param caching_enabled [Boolean]
       # @return [Hash] ready to serialize as JSON body
-      def build_request_body(messages, model, tools, max_tokens, caching_enabled)
+      def build_request_body(messages, model, tools, max_tokens, caching_enabled, thinking_enabled: nil, reasoning_effort: nil, provider_id: nil)
         system_messages = messages.select { |m| m[:role] == "system" }
         regular_messages = messages.reject { |m| m[:role] == "system" }
 
@@ -64,14 +64,21 @@ module Clacky
         body = { model: model, max_tokens: max_tokens, messages: api_messages }
         body[:system] = system_text unless system_text.empty?
         body[:tools]  = api_tools   if api_tools&.any?
+        apply_thinking_options!(body, model, max_tokens,
+                                thinking_enabled: thinking_enabled,
+                                reasoning_effort: reasoning_effort,
+                                provider_id: provider_id)
         body
       end
 
       # Build a streaming request body (same as build_request_body but with
       # stream: true).  Used for the streaming-first strategy when the client
       # prefers streaming over non-streaming Anthropic requests.
-      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled)
-        body = build_request_body(messages, model, tools, max_tokens, caching_enabled)
+      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, thinking_enabled: nil, reasoning_effort: nil, provider_id: nil)
+        body = build_request_body(messages, model, tools, max_tokens, caching_enabled,
+                                  thinking_enabled: thinking_enabled,
+                                  reasoning_effort: reasoning_effort,
+                                  provider_id: provider_id)
         body[:stream] = true
         body
       end
@@ -86,6 +93,11 @@ module Clacky
         usage   = data["usage"]   || {}
 
         content = blocks.select { |b| b["type"] == "text" }.map { |b| b["text"] }.join("")
+        thinking_blocks = blocks.filter_map { |b| canonicalize_thinking_block(b) }
+        thinking_text = thinking_blocks
+          .select { |b| b[:type] == "thinking" }
+          .map { |b| b[:thinking].to_s }
+          .join("")
 
         # tool_calls use canonical format (id, function: {name, arguments})
         tool_calls = blocks.select { |b| b["type"] == "tool_use" }.map do |tc|
@@ -148,8 +160,16 @@ module Clacky
         usage_data[:cache_read_input_tokens]     = cache_read     if cache_read     > 0
         usage_data[:cache_creation_input_tokens] = cache_creation if cache_creation > 0
 
-        { content: content, tool_calls: tool_calls, finish_reason: finish_reason,
-          usage: usage_data, raw_api_usage: usage }
+        result = {
+          content: content,
+          tool_calls: tool_calls,
+          finish_reason: finish_reason,
+          usage: usage_data,
+          raw_api_usage: usage
+        }
+        result[:thinking] = thinking_text unless thinking_text.empty?
+        result[:thinking_blocks] = thinking_blocks unless thinking_blocks.empty?
+        result
       end
 
       # Parse Anthropic SSE streaming chunks into canonical format.
@@ -186,15 +206,15 @@ module Clacky
         body = raw_chunks.join
         events = parse_anthropic_sse_events(body)
 
-        content       = +""
-        tool_calls    = []
-        current_tool  = nil   # { id:, name:, arguments: }
-        finish_reason = nil
-        usage_data    = {}
-        cache_read    = 0
+        content        = +""
+        tool_calls     = []
+        thinking_blocks = []
+        current_tool   = nil   # { id:, name:, arguments: }
+        current_thinking_block = nil
+        finish_reason  = nil
+        usage_data     = {}
+        cache_read     = 0
         cache_creation = 0
-        thinking      = +""
-        current_block_type = nil
 
         events.each do |event|
           event_type = event[:type]
@@ -211,13 +231,14 @@ module Clacky
 
           when "content_block_start"
             block = data["content_block"] || {}
-            current_block_type = block["type"]
             if block["type"] == "tool_use"
               current_tool = {
                 id:   block["id"],
                 name: block["name"],
                 arguments: +""
               }
+            elsif thinking_block_type?(block["type"])
+              current_thinking_block = canonicalize_thinking_block(block)
             end
 
           when "content_block_delta"
@@ -226,7 +247,15 @@ module Clacky
             when "text_delta"
               content << delta["text"] if delta["text"]
             when "thinking_delta"
-              thinking << delta["thinking"] if delta["thinking"]
+              if current_thinking_block && current_thinking_block[:type] == "thinking"
+                current_thinking_block[:thinking] = +"#{current_thinking_block[:thinking]}"
+                current_thinking_block[:thinking] << delta["thinking"].to_s
+              end
+            when "signature_delta"
+              if current_thinking_block && current_thinking_block[:type] == "thinking"
+                current_thinking_block[:signature] = +"#{current_thinking_block[:signature]}"
+                current_thinking_block[:signature] << delta["signature"].to_s
+              end
             when "input_json_delta"
               if current_tool
                 current_tool[:arguments] << delta["partial_json"] if delta["partial_json"]
@@ -237,8 +266,10 @@ module Clacky
             if current_tool
               tool_calls << current_tool
               current_tool = nil
+            elsif current_thinking_block
+              thinking_blocks << current_thinking_block
+              current_thinking_block = nil
             end
-            current_block_type = nil
 
           when "message_delta"
             delta = data["delta"] || {}
@@ -288,6 +319,10 @@ module Clacky
         }
         usage[:cache_read_input_tokens]     = cache_read     if cache_read     > 0
         usage[:cache_creation_input_tokens] = cache_creation if cache_creation > 0
+        thinking_text = thinking_blocks
+          .select { |b| b[:type] == "thinking" }
+          .map { |b| b[:thinking].to_s }
+          .join("")
 
         result = {
           content:       content.empty? ? nil : content,
@@ -299,7 +334,8 @@ module Clacky
             "cache_creation_input_tokens" => cache_creation
           )
         }
-        result[:thinking] = thinking unless thinking.empty?
+        result[:thinking] = thinking_text unless thinking_text.empty?
+        result[:thinking_blocks] = thinking_blocks unless thinking_blocks.empty?
         result
       end
 
@@ -340,10 +376,11 @@ module Clacky
         role      = msg[:role]
         content   = msg[:content]
         tool_calls = msg[:tool_calls]
+        thinking_blocks = extract_thinking_blocks(msg)
 
         # assistant with tool_calls → content blocks with tool_use
         if role == "assistant" && tool_calls&.any?
-          blocks = []
+          blocks = thinking_blocks.dup
           blocks << { type: "text", text: content } if content.is_a?(String) && !content.empty?
           blocks.concat(content_to_blocks(content)) if content.is_a?(Array)
 
@@ -408,7 +445,8 @@ module Clacky
         #   2. Adding cache_control to every user message causes Anthropic to treat every
         #      user message as a cache breakpoint, which invalidates the intended cache boundary
         #      and results in cache misses (cache_read=0) every turn.
-        blocks = content_to_blocks(content)
+        blocks = thinking_blocks.dup
+        blocks.concat(content_to_blocks(content))
         # Anthropic rejects messages with an empty content array — use a placeholder text block.
         blocks = [{ type: "text", text: "..." }] if blocks.empty?
         { role: role, content: blocks }
@@ -437,25 +475,123 @@ module Clacky
       private_class_method def self.normalize_block(block)
         return block unless block.is_a?(Hash)
 
-        case block[:type]
+        type = block[:type] || block["type"]
+
+        case type
         when "text"
           # Anthropic rejects blank text blocks — drop them instead of sending { type:"text", text:"" }
-          text = block[:text]
+          text = block[:text] || block["text"]
           return nil if text.nil? || text.empty?
 
           # Preserve cache_control if present (placed by Client#apply_message_caching)
           result = { type: "text", text: text }
-          result[:cache_control] = block[:cache_control] if block[:cache_control]
+          cache_control = block[:cache_control] || block["cache_control"]
+          result[:cache_control] = cache_control if cache_control
           result
         when "image_url"
-          url = block.dig(:image_url, :url) || block[:url]
+          url = block.dig(:image_url, :url) || block.dig("image_url", "url") || block[:url] || block["url"]
           url_to_image_block(url)
         when "image"
           block  # already Anthropic format
-        when "tool_result", "tool_use"
+        when "tool_result", "tool_use", "thinking", "redacted_thinking"
           block  # pass through
         else
           block
+        end
+      end
+
+      private_class_method def self.apply_thinking_options!(body, model, max_tokens, thinking_enabled:, reasoning_effort:, provider_id:)
+        enabled = normalize_thinking_enabled(thinking_enabled)
+        effort = normalize_anthropic_reasoning_effort(reasoning_effort)
+
+        if enabled == false
+          body[:thinking] = { type: "disabled" }
+          return body
+        end
+
+        return body unless enabled || effort
+
+        if adaptive_thinking_supported?(model, provider_id)
+          body[:thinking] = { type: "adaptive" }
+        elsif max_tokens.to_i > 1024
+          body[:thinking] = { type: "enabled", budget_tokens: 1024 }
+        else
+          return body
+        end
+
+        body[:output_config] = { effort: effort } if effort
+        body
+      end
+
+      private_class_method def self.normalize_thinking_enabled(value)
+        case value
+        when true, false
+          value
+        else
+          normalized = value.to_s.strip.downcase
+          return nil if normalized.empty? || normalized == "auto"
+          return true if %w[true on yes enabled enable].include?(normalized)
+          return false if %w[false off no disabled disable].include?(normalized)
+
+          nil
+        end
+      end
+
+      private_class_method def self.normalize_anthropic_reasoning_effort(value)
+        normalized = value.to_s.strip.downcase
+        case normalized
+        when "", "auto", "none"
+          nil
+        when "minimal", "low"
+          "low"
+        when "medium"
+          "medium"
+        when "high", "max", "xhigh"
+          "high"
+        else
+          nil
+        end
+      end
+
+      private_class_method def self.adaptive_thinking_supported?(model, provider_id)
+        return false if provider_id.to_s.start_with?("deepseek")
+
+        normalized = model.to_s.downcase.sub(/\Aanthropic\//, "")
+        normalized.include?("mythos") ||
+          normalized.include?("claude-opus-4-7") ||
+          normalized.include?("claude-opus-4-6") ||
+          normalized.include?("claude-sonnet-4.6") ||
+          normalized.include?("claude-sonnet-4-6")
+      end
+
+      private_class_method def self.extract_thinking_blocks(msg)
+        raw = msg[:thinking_blocks] || msg["thinking_blocks"]
+        Array(raw).filter_map do |block|
+          normalize_block(canonicalize_thinking_block(block))
+        end
+      end
+
+      private_class_method def self.thinking_block_type?(type)
+        %w[thinking redacted_thinking].include?(type.to_s)
+      end
+
+      private_class_method def self.canonicalize_thinking_block(block)
+        return nil unless block.is_a?(Hash)
+
+        type = block[:type] || block["type"]
+        case type
+        when "thinking"
+          {
+            type: "thinking",
+            thinking: (block[:thinking] || block["thinking"]).to_s,
+            signature: (block[:signature] || block["signature"])
+          }.compact
+        when "redacted_thinking"
+          result = { type: "redacted_thinking" }
+          result[:data] = block[:data] || block["data"] if block.key?(:data) || block.key?("data")
+          result
+        else
+          nil
         end
       end
 

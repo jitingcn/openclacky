@@ -2676,6 +2676,8 @@ module Clacky
             api_type:         m["api_type"],
             stream:           m.key?("stream") ? m["stream"] : nil,
             prompt_caching:   m.key?("prompt_caching") ? m["prompt_caching"] : nil,
+            thinking_enabled: m.key?("thinking_enabled") ? m["thinking_enabled"] : nil,
+            reasoning_effort: m["reasoning_effort"],
             type:             m["type"],
             compression_overrides: m["compression_overrides"] || {}
           }
@@ -2696,6 +2698,7 @@ module Clacky
             enable_compression:             @agent_config.enable_compression,
             enable_prompt_caching:          @agent_config.enable_prompt_caching,
             memory_update_enabled:          @agent_config.memory_update_enabled,
+            raw_response_logging_enabled:   @agent_config.raw_response_logging_enabled,
             skill_evolution:                @agent_config.skill_evolution,
             compression_token_threshold:    @agent_config.compression_token_threshold,
             compression_message_threshold:  @agent_config.compression_message_threshold,
@@ -2718,7 +2721,7 @@ module Clacky
         settings = body["settings"]
 
         # Boolean settings
-        %w[enable_compression enable_prompt_caching memory_update_enabled].each do |key|
+        %w[enable_compression enable_prompt_caching memory_update_enabled raw_response_logging_enabled].each do |key|
           if settings.key?(key)
             @agent_config.send(:"#{key}=", settings[key])
           end
@@ -2788,7 +2791,9 @@ module Clacky
           "anthropic_format" => body["anthropic_format"] || false,
           "api_type"         => body["api_type"],
           "stream"           => body.key?("stream") ? body["stream"] : nil,
-          "prompt_caching"   => body.key?("prompt_caching") ? body["prompt_caching"] : nil
+          "prompt_caching"   => body.key?("prompt_caching") ? body["prompt_caching"] : nil,
+          "thinking_enabled" => body.key?("thinking_enabled") ? body["thinking_enabled"] : nil,
+          "reasoning_effort" => body["reasoning_effort"]
         }.compact
         # Per-model compression overrides (optional)
         if body["compression_overrides"].is_a?(Hash) && !body["compression_overrides"].empty?
@@ -2871,6 +2876,21 @@ module Clacky
         # prompt_caching: true (enabled), false (disabled), null (auto — detect by format)
         if body.key?("prompt_caching")
           target["prompt_caching"] = body["prompt_caching"]
+        end
+        if body.key?("thinking_enabled")
+          if body["thinking_enabled"].nil?
+            target.delete("thinking_enabled")
+          else
+            target["thinking_enabled"] = body["thinking_enabled"]
+          end
+        end
+        if body.key?("reasoning_effort")
+          val = body["reasoning_effort"].to_s.strip
+          if val.empty?
+            target.delete("reasoning_effort")
+          else
+            target["reasoning_effort"] = val
+          end
         end
         if body.key?("api_key")
           new_key = body["api_key"].to_s
@@ -2999,7 +3019,10 @@ module Clacky
             anthropic_format: body["anthropic_format"] || false,
             anthropic_stream: body.key?("anthropic_stream") ? body["anthropic_stream"] : true,
             api_type:         api_type_value,
-            stream:           stream_value
+            stream:           stream_value,
+            thinking_enabled: body.key?("thinking_enabled") ? body["thinking_enabled"] : nil,
+            reasoning_effort: body["reasoning_effort"],
+            raw_response_logging: @agent_config.raw_response_logging_enabled
           )
           result = test_client.test_connection(model: model)
           if result[:success]
@@ -3204,7 +3227,10 @@ module Clacky
           anthropic_format: model_cfg["anthropic_format"] || false,
           anthropic_stream: model_cfg.key?("anthropic_stream") ? model_cfg["anthropic_stream"] : true,
           api_type:         model_cfg["api_type"],
-          stream:           model_cfg.key?("stream") ? model_cfg["stream"] : nil
+          stream:           model_cfg.key?("stream") ? model_cfg["stream"] : nil,
+          thinking_enabled: model_cfg.key?("thinking_enabled") ? model_cfg["thinking_enabled"] : nil,
+          reasoning_effort: model_cfg["reasoning_effort"],
+          raw_response_logging: @agent_config.raw_response_logging_enabled
         )
 
         # Override Faraday timeouts via a short-lived env var isn't ideal;
@@ -3813,7 +3839,10 @@ module Clacky
           anthropic_format: config.anthropic_format?,
           anthropic_stream: config.anthropic_stream?,
           api_type: config.api_type,
-          stream: config.stream
+          stream: config.stream,
+          thinking_enabled: config.thinking_enabled,
+          reasoning_effort: config.reasoning_effort,
+          raw_response_logging: config.raw_response_logging_enabled
         )
 
         broadcaster = method(:broadcast)

@@ -124,7 +124,10 @@ module Clacky
           anthropic_format: agent_config.anthropic_format?,
           anthropic_stream: agent_config.anthropic_stream?,
           api_type: agent_config.api_type,
-          stream: agent_config.stream
+          stream: agent_config.stream,
+          thinking_enabled: agent_config.thinking_enabled,
+          reasoning_effort: agent_config.reasoning_effort,
+          raw_response_logging: agent_config.raw_response_logging_enabled
         )
       end
 
@@ -224,8 +227,12 @@ module Clacky
             base_url: test_config.base_url,
             model: test_config.model_name,
             anthropic_format: test_config.anthropic_format?,
+            anthropic_stream: test_config.anthropic_stream?,
             api_type: test_config.api_type,
-            stream: test_config.stream
+            stream: test_config.stream,
+            thinking_enabled: test_config.thinking_enabled,
+            reasoning_effort: test_config.reasoning_effort,
+            raw_response_logging: test_config.raw_response_logging_enabled
           )
           test_client.test_connection(model: test_config.model_name)
         end
@@ -1056,8 +1063,12 @@ module Clacky
             base_url: agent_config.base_url,
             model: agent_config.model_name,
             anthropic_format: agent_config.anthropic_format?,
+            anthropic_stream: agent_config.anthropic_stream?,
             api_type: agent_config.api_type,
-            stream: agent_config.stream
+            stream: agent_config.stream,
+            thinking_enabled: agent_config.thinking_enabled,
+            reasoning_effort: agent_config.reasoning_effort,
+            raw_response_logging: agent_config.raw_response_logging_enabled
           )
         end
 

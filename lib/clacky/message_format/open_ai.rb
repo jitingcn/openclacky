@@ -44,11 +44,11 @@ module Clacky
       # @param vision_supported [Boolean] whether the target model accepts
       #   image_url content blocks (default true, conservative)
       # @return [Hash]
-      def build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, thinking_level: nil)
+      def build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, reasoning_effort: nil)
         api_messages = messages.map { |msg| normalize_message_content(msg, vision_supported: vision_supported) }
 
         body = { model: model, max_tokens: max_tokens, messages: api_messages }
-        apply_thinking_options!(body, thinking_level)
+        apply_reasoning_options!(body, reasoning_effort)
 
         if tools&.any?
           if caching_enabled
@@ -139,8 +139,8 @@ module Clacky
       # @param caching_enabled [Boolean]
       # @param vision_supported [Boolean]
       # @return [Hash]
-      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, thinking_level: nil)
-        body = build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: vision_supported, thinking_level: thinking_level)
+      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, reasoning_effort: nil)
+        body = build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: vision_supported, reasoning_effort: reasoning_effort)
         body[:stream] = true
         # Ask the API to include token usage in the final chunk (OpenAI >= 2024).
         # Older proxies silently ignore unknown fields, so this is safe.
@@ -368,12 +368,11 @@ module Clacky
 
       # ── Private helpers ───────────────────────────────────────────────────────
 
-      private_class_method def self.apply_thinking_options!(body, thinking_level)
-        level = thinking_level.to_s.strip.downcase
+      private_class_method def self.apply_reasoning_options!(body, reasoning_effort)
+        level = reasoning_effort.to_s.strip.downcase
         return body if level.empty?
 
         body[:reasoning_effort] = level
-        body[:reasoning] = { effort: level }
         body
       end
 

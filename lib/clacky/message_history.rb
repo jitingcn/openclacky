@@ -219,6 +219,13 @@ module Clacky
         end
       end
 
+      if message[:thinking_blocks].is_a?(Array)
+        message[:thinking_blocks].each do |block|
+          next unless block.is_a?(Hash)
+          tokens += estimate_content_tokens(block[:thinking] || block["thinking"])
+        end
+      end
+
       tokens
     end
 

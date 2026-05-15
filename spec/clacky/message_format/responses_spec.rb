@@ -4,14 +4,14 @@ require "spec_helper"
 
 RSpec.describe Clacky::MessageFormat::Responses do
   describe ".build_request_body" do
-    it "adds reasoning options when thinking_level is enabled" do
+    it "adds reasoning options when reasoning_effort is configured" do
       body = described_class.build_request_body(
         [{ role: "user", content: "hi" }],
         "gpt-5.4",
         [],
         128,
         false,
-        thinking_level: "medium"
+        reasoning_effort: "medium"
       )
 
       expect(body[:reasoning]).to eq({ effort: "medium" })

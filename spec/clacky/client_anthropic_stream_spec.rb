@@ -9,14 +9,17 @@ RSpec.describe Clacky::Client, "Anthropic streaming transport" do
   let(:base_url) { "https://api.anthropic.com" }
   let(:model) { "claude-sonnet-4-6" }
 
-  def build_client(connection:, anthropic_stream: true, stream: nil)
+  def build_client(connection:, anthropic_stream: true, stream: nil, thinking_enabled: nil, reasoning_effort: nil, raw_response_logging: false)
     client = described_class.new(
       api_key,
       base_url: base_url,
       model: model,
       anthropic_format: true,
       anthropic_stream: anthropic_stream,
-      stream: stream
+      stream: stream,
+      thinking_enabled: thinking_enabled,
+      reasoning_effort: reasoning_effort,
+      raw_response_logging: raw_response_logging
     )
     client.instance_variable_set(:@anthropic_connection, connection)
     client
@@ -69,6 +72,42 @@ RSpec.describe Clacky::Client, "Anthropic streaming transport" do
     expect(result.dig(:latency, :streaming)).to eq(true)
     expect(streamed_events).to include(hash_including(content_delta: "Hello"))
 
+    test.verify_stubbed_calls
+  end
+
+  it "captures raw anthropic SSE when raw response logging is enabled" do
+    response_body = sse_body(
+      ["message_start", { type: "message_start", message: { id: "msg_raw", usage: { input_tokens: 12 } } }],
+      ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+      ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello" } }],
+      ["content_block_stop", { type: "content_block_stop", index: 0 }],
+      ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } }],
+      ["message_stop", { type: "message_stop" }]
+    )
+
+    test = Faraday::Adapter::Test::Stubs.new do |stub|
+      stub.post("/v1/messages") do |env|
+        env.request.on_data.call(response_body, response_body.bytesize, env) if env.request.on_data
+        [200, { "Content-Type" => "text/event-stream" }, ""]
+      end
+    end
+
+    connection = Faraday.new(url: base_url) do |conn|
+      conn.adapter :test, test
+    end
+
+    client = build_client(connection: connection, raw_response_logging: true)
+    result = client.send_messages_with_tools(
+      [{ role: "user", content: "Say hi" }],
+      model: model,
+      tools: [],
+      max_tokens: 64,
+      enable_caching: false
+    )
+
+    expect(result.dig(:raw_response_debug, :transport)).to eq("anthropic-messages")
+    expect(result.dig(:raw_response_debug, :streaming)).to eq(true)
+    expect(result.dig(:raw_response_debug, :response_body)).to eq(response_body)
     test.verify_stubbed_calls
   end
 
@@ -219,6 +258,33 @@ RSpec.describe Clacky::Client, "Anthropic streaming transport" do
 
     expect(result).to eq({ success: true })
     expect(captured_body.key?("stream")).to eq(false)
+    test.verify_stubbed_calls
+  end
+
+  it "uses a larger max_tokens budget for anthropic test_connection when reasoning effort is configured" do
+    captured_body = nil
+    test = Faraday::Adapter::Test::Stubs.new do |stub|
+      stub.post("/v1/messages") do |env|
+        captured_body = JSON.parse(env.body)
+        [200, { "Content-Type" => "application/json" }, { id: "msg_test" }.to_json]
+      end
+    end
+
+    connection = Faraday.new(url: base_url) do |conn|
+      conn.adapter :test, test
+    end
+
+    client = build_client(
+      connection: connection,
+      anthropic_stream: false,
+      reasoning_effort: "medium"
+    )
+    result = client.test_connection(model: model)
+
+    expect(result).to eq({ success: true })
+    expect(captured_body["max_tokens"]).to eq(2048)
+    expect(captured_body.dig("thinking", "type")).to eq("adaptive")
+    expect(captured_body.dig("output_config", "effort")).to eq("medium")
     test.verify_stubbed_calls
   end
 

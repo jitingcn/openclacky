@@ -4,6 +4,67 @@ require "spec_helper"
 require "json"
 
 RSpec.describe Clacky::MessageFormat::Anthropic do
+  describe ".build_request_body" do
+    it "adds adaptive thinking and output_config for Claude 4.6+" do
+      body = described_class.build_request_body(
+        [{ role: "user", content: "hello" }],
+        "claude-sonnet-4.6",
+        [],
+        4096,
+        false,
+        thinking_enabled: true,
+        reasoning_effort: "max",
+        provider_id: "anthropic"
+      )
+
+      expect(body[:thinking]).to eq({ type: "adaptive" })
+      expect(body[:output_config]).to eq({ effort: "high" })
+    end
+
+    it "round-trips stored thinking blocks ahead of tool_use blocks" do
+      body = described_class.build_request_body(
+        [{
+          role: "assistant",
+          content: "",
+          thinking_blocks: [
+            { type: "thinking", thinking: "Need a tool.", signature: "sig_123" }
+          ],
+          tool_calls: [
+            { id: "call_1", type: "function", name: "read_file", arguments: '{"path":"README.md"}' }
+          ]
+        }],
+        "claude-sonnet-4.6",
+        [],
+        4096,
+        false
+      )
+
+      blocks = body.fetch(:messages).first.fetch(:content)
+      expect(blocks.first).to eq({ type: "thinking", thinking: "Need a tool.", signature: "sig_123" })
+      expect(blocks.last[:type]).to eq("tool_use")
+      expect(blocks.last[:id]).to eq("call_1")
+    end
+  end
+
+  describe ".parse_response" do
+    it "preserves thinking blocks and exposes text for UI rendering" do
+      data = {
+        "content" => [
+          { "type" => "thinking", "thinking" => "Let me think.", "signature" => "sig_1" },
+          { "type" => "text", "text" => "Done." }
+        ],
+        "usage" => { "input_tokens" => 10, "output_tokens" => 2 }
+      }
+
+      result = described_class.parse_response(data)
+      expect(result[:thinking]).to eq("Let me think.")
+      expect(result[:thinking_blocks]).to eq([
+        { type: "thinking", thinking: "Let me think.", signature: "sig_1" }
+      ])
+      expect(result[:content]).to eq("Done.")
+    end
+  end
+
   describe ".format_tool_results" do
     it "accepts tool_call_id/result shaped tool results" do
       response = {
@@ -217,6 +278,7 @@ RSpec.describe Clacky::MessageFormat::Anthropic, "streaming" do
         ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }],
         ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Let me think. " } }],
         ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "Checking context." } }],
+        ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig_abc" } }],
         ["content_block_stop", { type: "content_block_stop", index: 0 }],
         ["content_block_start", { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }],
         ["content_block_delta", { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Mimi" } }],
@@ -228,6 +290,9 @@ RSpec.describe Clacky::MessageFormat::Anthropic, "streaming" do
       result = described_class.parse_stream_response([sse])
 
       expect(result[:thinking]).to eq("Let me think. Checking context.")
+      expect(result[:thinking_blocks]).to eq([
+        { type: "thinking", thinking: "Let me think. Checking context.", signature: "sig_abc" }
+      ])
       expect(result[:content]).to eq("Mimi")
       expect(result[:finish_reason]).to eq("stop")
     end

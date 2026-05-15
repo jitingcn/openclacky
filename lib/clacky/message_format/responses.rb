@@ -76,7 +76,7 @@ module Clacky
       # @param previous_response_id [String, nil] previous response ID for
       #   multi-turn continuity
       # @return [Hash]
-      def build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, previous_response_id: nil, thinking_level: nil)
+      def build_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, previous_response_id: nil, reasoning_effort: nil)
         input_items = messages.flat_map { |msg| convert_message_to_input_items(msg, vision_supported: vision_supported, previous_response_id: previous_response_id) }
 
         body = {
@@ -85,7 +85,7 @@ module Clacky
           max_output_tokens: max_tokens,
           store: false
         }
-        apply_thinking_options!(body, thinking_level)
+        apply_reasoning_options!(body, reasoning_effort)
 
         body[:previous_response_id] = previous_response_id if previous_response_id
 
@@ -101,12 +101,12 @@ module Clacky
       # Same as build_request_body but with stream: true.
       #
       # @return [Hash]
-      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, previous_response_id: nil, thinking_level: nil)
+      def build_stream_request_body(messages, model, tools, max_tokens, caching_enabled, vision_supported: true, previous_response_id: nil, reasoning_effort: nil)
         body = build_request_body(
           messages, model, tools, max_tokens, caching_enabled,
           vision_supported: vision_supported,
           previous_response_id: previous_response_id,
-          thinking_level: thinking_level
+          reasoning_effort: reasoning_effort
         )
         body[:stream] = true
         body
@@ -521,8 +521,8 @@ module Clacky
 
       # Parse raw SSE body into an array of { type:, data: } hashes.
       # Handles both standard (event: ...\ndata: ...) and simple (data: only) formats.
-      private def apply_thinking_options!(body, thinking_level)
-        level = thinking_level.to_s.strip.downcase
+      private def apply_reasoning_options!(body, reasoning_effort)
+        level = reasoning_effort.to_s.strip.downcase
         return body if level.empty?
 
         body[:reasoning] = { effort: level }

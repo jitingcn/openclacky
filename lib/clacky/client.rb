@@ -36,12 +36,15 @@ module Clacky
     # We generate both on first request per session and reuse them.
     attr_reader :cache_affinity_session_id, :cache_affinity_device_id, :cache_affinity_user_id
 
-    def initialize(api_key, base_url:, model:, anthropic_format: false, anthropic_stream: false, api_type: nil, stream: nil)
+    def initialize(api_key, base_url:, model:, anthropic_format: false, anthropic_stream: false, api_type: nil, stream: nil, thinking_enabled: nil, reasoning_effort: nil, raw_response_logging: false)
       @api_key = api_key
       @base_url = base_url
       @model = model
       @anthropic_stream = anthropic_stream
       @stream = stream  # true = always stream, false = never stream, nil = auto
+      @thinking_enabled = normalize_thinking_enabled(thinking_enabled)
+      @reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+      @raw_response_logging = raw_response_logging
 
       # ── Cache affinity identity ──────────────────────────────────────────────
       # Generate stable identifiers for proxy channel affinity.
@@ -157,30 +160,33 @@ module Clacky
     # Test API connection by sending a minimal request.
     # Returns { success: true } or { success: false, error: "..." }.
     def test_connection(model:)
+      max_tokens = connection_test_max_tokens
+      messages = [{ role: "user", content: "hi" }]
+
       if bedrock?
         body = MessageFormat::Bedrock.build_request_body(
           [{ role: :user, content: "hi" }], model, [], 16
         ).to_json
         response = bedrock_connection.post(bedrock_endpoint(model)) { |r| r.body = body }
       elsif anthropic_format?
-        minimal_body = if @anthropic_stream
-          { model: model, max_tokens: 16, stream: true,
-            messages: [{ role: "user", content: "hi" }] }.to_json
+        body = if @anthropic_stream
+          build_anthropic_stream_request_body(messages, model, [], max_tokens, false)
         else
-          { model: model, max_tokens: 16,
-            messages: [{ role: "user", content: "hi" }] }.to_json
+          build_anthropic_request_body(messages, model, [], max_tokens, false)
         end
-        response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = minimal_body }
+        response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
       elsif @use_responses
         begin
           # Use stream_raw to test connection — works with both streaming-only
           # and non-streaming proxies. Just consume the first event.
-          stream = @openai_sdk_client.responses.stream_raw(
+          params = {
             model: model,
-            max_output_tokens: 16,
+            max_output_tokens: max_tokens,
             store: false,
-            input: [{ role: "user", content: "hi" }]
-          )
+            input: messages
+          }
+          apply_sdk_reasoning_options!(params)
+          stream = @openai_sdk_client.responses.stream_raw(params)
           # Consume at least one event to confirm the connection works
           stream.each { |_event| break }
           return { success: true }
@@ -190,10 +196,9 @@ module Clacky
           return { success: false, error: e.message }
         end
       else
-        minimal_body = { model: model, max_tokens: 16,
-                         messages: [{ role: "user", content: "hi" }] }
-        minimal_body[:stream] = true if @stream
-        response = openai_connection.post("chat/completions") { |r| r.body = minimal_body.to_json }
+        body = @stream ? build_openai_stream_request_body(messages, model, [], max_tokens, false) :
+                         build_openai_request_body(messages, model, [], max_tokens, false)
+        response = openai_connection.post("chat/completions") { |r| r.body = body.to_json }
 
         # Auto mode: retry with streaming if server requires it
         if response.status == 400 && @stream.nil?
@@ -204,8 +209,8 @@ module Clacky
           end
           error_msg = error_body.is_a?(Hash) ? error_body.dig("error", "message").to_s : ""
           if error_msg.match?(/stream/i)
-            minimal_body[:stream] = true
-            response = openai_connection.post("chat/completions") { |r| r.body = minimal_body.to_json }
+            body = build_openai_stream_request_body(messages, model, [], max_tokens, false)
+            response = openai_connection.post("chat/completions") { |r| r.body = body.to_json }
           end
         end
       end
@@ -245,7 +250,7 @@ module Clacky
         end
 
         # Non-streaming path — either explicitly disabled or streaming fallback
-        body     = MessageFormat::Anthropic.build_request_body(messages, model, [], max_tokens, false)
+        body     = build_anthropic_request_body(messages, model, [], max_tokens, false)
         inject_cache_affinity!(body, :anthropic)
         response = anthropic_connection.post(anthropic_messages_path) { |r| r.body = body.to_json }
         # Fall back to Responses API (via OpenAI SDK) when Anthropic endpoint
@@ -257,19 +262,25 @@ module Clacky
             @use_responses = true
             @openai_sdk_client ||= build_openai_client
             begin
-              sdk_resp = @openai_sdk_client.responses.create(
+              params = {
                 model: model, max_output_tokens: max_tokens,
                 store: false, input: messages,
                 prompt_cache_key: @cache_affinity_session_id
-              )
+              }
+              apply_sdk_reasoning_options!(params)
+              sdk_resp = @openai_sdk_client.responses.create(params)
               return extract_response_text(sdk_resp)
             rescue OpenAI::Errors::BadRequestError => e
               if e.message.include?("stream") || e.message.include?("Stream")
-                sdk_resp = stream_responses_via_sdk(
-                  model: model, max_output_tokens: max_tokens,
-                  store: false, input: messages,
+                params = {
+                  model: model,
+                  max_output_tokens: max_tokens,
+                  store: false,
+                  input: messages,
                   prompt_cache_key: @cache_affinity_session_id
-                )
+                }
+                apply_sdk_reasoning_options!(params)
+                sdk_resp = stream_responses_via_sdk(params)
                 return extract_response_text(sdk_resp)
               end
               raise map_sdk_error(e)
@@ -282,22 +293,28 @@ module Clacky
       elsif @use_responses
         # Use OpenAI SDK for Responses API.
         begin
-          sdk_resp = @openai_sdk_client.responses.create(
+          params = {
             model: model,
             max_output_tokens: max_tokens,
             store: false,
             input: messages,
             prompt_cache_key: @cache_affinity_session_id
-          )
+          }
+          apply_sdk_reasoning_options!(params)
+          sdk_resp = @openai_sdk_client.responses.create(params)
           extract_response_text(sdk_resp)
         rescue OpenAI::Errors::BadRequestError => e
           # Proxy requires streaming — fallback to stream + get_final_response
           if e.message.include?("stream") || e.message.include?("Stream")
-            sdk_resp = stream_responses_via_sdk(
-              model: model, max_output_tokens: max_tokens,
-              store: false, input: messages,
+            params = {
+              model: model,
+              max_output_tokens: max_tokens,
+              store: false,
+              input: messages,
               prompt_cache_key: @cache_affinity_session_id
-            )
+            }
+            apply_sdk_reasoning_options!(params)
+            sdk_resp = stream_responses_via_sdk(params)
             extract_response_text(sdk_resp)
           else
             raise map_sdk_error(e)
@@ -319,7 +336,7 @@ module Clacky
         end
 
         # Non-streaming path — either @stream == false or streaming fallback
-        body = { model: model, max_tokens: max_tokens, messages: messages }
+        body = build_openai_request_body(messages, model, [], max_tokens, false)
         inject_cache_affinity!(body, :openai)
 
         # Try non-streaming with a short timeout (15s).  Some servers
@@ -549,7 +566,7 @@ module Clacky
       end
 
       # Non-streaming path — either @stream == false or streaming fallback
-      body     = MessageFormat::Anthropic.build_request_body(messages, model, tools, max_tokens, caching_enabled)
+      body     = build_anthropic_request_body(messages, model, tools, max_tokens, caching_enabled)
       inject_cache_affinity!(body, :anthropic)
       response = anthropic_connection.post(anthropic_messages_path) { |r|
         r.body = body.to_json
@@ -582,7 +599,15 @@ module Clacky
       raise_error(response) unless response.status == 200
       check_html_response(response)
       parsed_body = safe_json_parse(response.body, context: "LLM response")
-      MessageFormat::Anthropic.parse_response(parsed_body)
+      attach_raw_response_debug(
+        MessageFormat::Anthropic.parse_response(parsed_body),
+        transport: "anthropic-messages",
+        request_body: body,
+        response_body: response.body,
+        streaming: false,
+        status: response.status,
+        content_type: response.headers["Content-Type"]
+      )
     end
 
     def parse_simple_anthropic_response(response)
@@ -600,7 +625,7 @@ module Clacky
       # Apply cache_control to the message that marks the cache breakpoint
       messages = apply_message_caching(messages) if caching_enabled
 
-      body = MessageFormat::Anthropic.build_stream_request_body(messages, model, tools, max_tokens, caching_enabled)
+      body = build_anthropic_stream_request_body(messages, model, tools, max_tokens, caching_enabled)
       inject_cache_affinity!(body, :anthropic)
 
       chunks = []
@@ -629,7 +654,15 @@ module Clacky
         raise StreamFallbackError, "Anthropic streaming returned HTML — falling back to non-streaming"
       end
 
-      MessageFormat::Anthropic.parse_stream_response(chunks)
+      attach_raw_response_debug(
+        MessageFormat::Anthropic.parse_stream_response(chunks),
+        transport: "anthropic-messages",
+        request_body: body,
+        response_body: chunks.join,
+        streaming: true,
+        status: response.status,
+        content_type: response.headers["Content-Type"]
+      )
     end
 
     def parse_simple_anthropic_response(response)
@@ -640,9 +673,7 @@ module Clacky
 
     # Streaming variant of parse_simple_anthropic_response.  Returns accumulated text.
     def parse_simple_anthropic_stream_response(model, messages, max_tokens)
-      body = MessageFormat::Anthropic.build_stream_request_body(
-        messages, model, [], max_tokens, false
-      )
+      body = build_anthropic_stream_request_body(messages, model, [], max_tokens, false)
       inject_cache_affinity!(body, :anthropic)
 
       chunks = []
@@ -685,11 +716,7 @@ module Clacky
         end
       end
 
-      body     = MessageFormat::OpenAI.build_request_body(
-        messages, model, tools, max_tokens, caching_enabled,
-        vision_supported: @vision_supported,
-        thinking_level: @config&.thinking_level
-      )
+      body     = build_openai_request_body(messages, model, tools, max_tokens, caching_enabled)
       inject_cache_affinity!(body, :openai)
 
       # Try non-streaming first with a short timeout (15s).  Some providers
@@ -728,7 +755,15 @@ module Clacky
       end
       
       parsed_body = safe_json_parse(response.body, context: "LLM response")
-      MessageFormat::OpenAI.parse_response(parsed_body)
+      attach_raw_response_debug(
+        MessageFormat::OpenAI.parse_response(parsed_body),
+        transport: "openai-chat-completions",
+        request_body: body,
+        response_body: response.body,
+        streaming: false,
+        status: response.status,
+        content_type: response.headers["Content-Type"]
+      )
     end
 
     # Streaming variant of send_openai_request for providers that require
@@ -740,11 +775,7 @@ module Clacky
       # OpenRouter proxies Claude with the same cache_control field convention as Anthropic direct.
       messages = apply_message_caching(messages) if caching_enabled
 
-      body = MessageFormat::OpenAI.build_stream_request_body(
-        messages, model, tools, max_tokens, caching_enabled,
-        vision_supported: @vision_supported,
-        thinking_level: @config&.thinking_level
-      )
+      body = build_openai_stream_request_body(messages, model, tools, max_tokens, caching_enabled)
       inject_cache_affinity!(body, :openai)
 
       chunks = []
@@ -764,7 +795,15 @@ module Clacky
         raise StreamFallbackError, "OpenAI streaming returned HTML — falling back to non-streaming"
       end
 
-      MessageFormat::OpenAI.parse_stream_response(chunks)
+      attach_raw_response_debug(
+        MessageFormat::OpenAI.parse_stream_response(chunks),
+        transport: "openai-chat-completions",
+        request_body: body,
+        response_body: chunks.join,
+        streaming: true,
+        status: response.status,
+        content_type: response.headers["Content-Type"]
+      )
     end
 
     def parse_simple_openai_response(response)
@@ -776,8 +815,7 @@ module Clacky
     # Streaming variant of parse_simple_openai_response for providers that
     # require stream: true.  Returns the accumulated text content.
     def parse_simple_openai_stream_response(model, messages, max_tokens)
-      body = { model: model, max_tokens: max_tokens, messages: messages,
-               stream: true, stream_options: { include_usage: true } }
+      body = build_openai_stream_request_body(messages, model, [], max_tokens, false)
       inject_cache_affinity!(body, :openai)
 
       chunks = []
@@ -826,7 +864,7 @@ module Clacky
         store: false,
         prompt_cache_key: @cache_affinity_session_id
       }
-      apply_sdk_thinking_options!(params)
+      apply_sdk_reasoning_options!(params)
 
       if tools&.any?
         params[:tools] = tools.map { |t| MessageFormat::Responses.convert_tool_to_responses_format(t) }
@@ -838,16 +876,16 @@ module Clacky
         # skip the non-streaming create() attempt entirely.
         if @stream
           result = stream_responses_via_sdk(params, on_stream_event: on_stream_event)
-          result.is_a?(Hash) ? result : convert_sdk_response(result)
+          result.is_a?(Hash) ? result : attach_sdk_raw_response_debug(convert_sdk_response(result), transport: "openai-responses-sdk", params: params, raw_payload: result, streaming: true)
         else
           sdk_resp = @openai_sdk_client.responses.create(params)
-          convert_sdk_response(sdk_resp)
+          attach_sdk_raw_response_debug(convert_sdk_response(sdk_resp), transport: "openai-responses-sdk", params: params, raw_payload: sdk_resp, streaming: false)
         end
       rescue OpenAI::Errors::BadRequestError => e
         # Proxy requires streaming — fall back to SDK's stream_raw
         if e.message.include?("stream") || e.message.include?("Stream")
           result = stream_responses_via_sdk(params, on_stream_event: on_stream_event)
-          result.is_a?(Hash) ? result : convert_sdk_response(result)
+          result.is_a?(Hash) ? result : attach_sdk_raw_response_debug(convert_sdk_response(result), transport: "openai-responses-sdk", params: params, raw_payload: result, streaming: true)
         else
           raise map_sdk_error(e)
         end
@@ -876,7 +914,9 @@ module Clacky
       resp_id       = nil
 
       raw_stream = @openai_sdk_client.responses.stream_raw(params)
+      raw_events = @raw_response_logging ? [] : nil
       raw_stream.each do |event|
+        raw_events << serialize_debug_payload(event) if raw_events
         case event.type
         when :"response.output_text.delta"
           if event.delta
@@ -915,14 +955,20 @@ module Clacky
         end
       end
 
-      build_canonical_from_stream(content_parts, reasoning_parts, tool_calls, usage_data, resp_id)
+      attach_sdk_raw_response_debug(
+        build_canonical_from_stream(content_parts, reasoning_parts, tool_calls, usage_data, resp_id),
+        transport: "openai-responses-sdk",
+        params: params,
+        raw_payload: raw_events,
+        streaming: true
+      )
     end
 
-    private def apply_sdk_thinking_options!(params)
-      level = @config&.thinking_level.to_s.strip.downcase
-      return params if level.empty?
+    private def apply_sdk_reasoning_options!(params)
+      effort = effective_responses_reasoning_effort
+      return params if effort.to_s.empty?
 
-      params[:reasoning] = { effort: level }
+      params[:reasoning] = { effort: effort }
       params
     end
 
@@ -977,6 +1023,183 @@ module Clacky
       }
       result[:reasoning_content] = reasoning if reasoning
       result
+    end
+
+    private def build_openai_request_body(messages, model, tools, max_tokens, caching_enabled)
+      body = MessageFormat::OpenAI.build_request_body(
+        messages, model, tools, max_tokens, caching_enabled,
+        vision_supported: @vision_supported,
+        reasoning_effort: effective_openai_reasoning_effort
+      )
+      apply_openai_provider_specific_thinking!(body)
+    end
+
+    private def build_openai_stream_request_body(messages, model, tools, max_tokens, caching_enabled)
+      body = MessageFormat::OpenAI.build_stream_request_body(
+        messages, model, tools, max_tokens, caching_enabled,
+        vision_supported: @vision_supported,
+        reasoning_effort: effective_openai_reasoning_effort
+      )
+      apply_openai_provider_specific_thinking!(body)
+    end
+
+    private def apply_openai_provider_specific_thinking!(body)
+      thinking_type = deepseek_openai_thinking_type
+      body[:thinking] = { type: thinking_type } if thinking_type
+      body
+    end
+
+    private def build_anthropic_request_body(messages, model, tools, max_tokens, caching_enabled)
+      MessageFormat::Anthropic.build_request_body(
+        messages, model, tools, max_tokens, caching_enabled,
+        thinking_enabled: @thinking_enabled,
+        reasoning_effort: @reasoning_effort,
+        provider_id: @provider_id
+      )
+    end
+
+    private def build_anthropic_stream_request_body(messages, model, tools, max_tokens, caching_enabled)
+      MessageFormat::Anthropic.build_stream_request_body(
+        messages, model, tools, max_tokens, caching_enabled,
+        thinking_enabled: @thinking_enabled,
+        reasoning_effort: @reasoning_effort,
+        provider_id: @provider_id
+      )
+    end
+
+    private def deepseek_openai_thinking_type
+      return nil unless @provider_id.to_s.start_with?("deepseek")
+
+      case @thinking_enabled
+      when true then "enabled"
+      when false then "disabled"
+      else nil
+      end
+    end
+
+    private def effective_openai_reasoning_effort
+      if @provider_id.to_s.start_with?("deepseek")
+        return "none" if @thinking_enabled == false
+        return @reasoning_effort
+      end
+
+      case @thinking_enabled
+      when false
+        openai_supports_none_reasoning_effort? ? "none" : "minimal"
+      when true
+        normalize_openai_reasoning_effort(@reasoning_effort || "medium")
+      else
+        normalize_openai_reasoning_effort(@reasoning_effort)
+      end
+    end
+
+    private def effective_responses_reasoning_effort
+      case @thinking_enabled
+      when false
+        openai_supports_none_reasoning_effort? ? "none" : "minimal"
+      when true
+        normalize_openai_reasoning_effort(@reasoning_effort || "medium")
+      else
+        normalize_openai_reasoning_effort(@reasoning_effort)
+      end
+    end
+
+    private def normalize_openai_reasoning_effort(value)
+      normalized = value.to_s.strip.downcase
+      case normalized
+      when "", "auto"
+        nil
+      when "none"
+        openai_supports_none_reasoning_effort? ? "none" : "minimal"
+      when "minimal", "low", "medium", "high", "xhigh"
+        normalized
+      when "max"
+        "high"
+      else
+        nil
+      end
+    end
+
+    private def openai_supports_none_reasoning_effort?
+      normalized_model_name.start_with?("gpt-5")
+    end
+
+    private def normalized_model_name
+      @model.to_s.downcase.sub(/\Aopenai\//, "").sub(/\Aanthropic\//, "")
+    end
+
+    private def normalize_thinking_enabled(value)
+      case value
+      when true, false
+        value
+      else
+        normalized = value.to_s.strip.downcase
+        return nil if normalized.empty? || normalized == "auto"
+        return true if %w[true on yes enabled enable].include?(normalized)
+        return false if %w[false off no disabled disable].include?(normalized)
+
+        nil
+      end
+    end
+
+    private def normalize_reasoning_effort(value)
+      normalized = value.to_s.strip.downcase
+      return nil if normalized.empty? || normalized == "auto"
+      return normalized if %w[none minimal low medium high max xhigh].include?(normalized)
+
+      nil
+    end
+
+    private def connection_test_max_tokens
+      anthropic_reasoning_configured_for_connection_test? ? 2048 : 16
+    end
+
+    private def anthropic_reasoning_configured_for_connection_test?
+      anthropic_format? && @thinking_enabled != false && (@thinking_enabled || !@reasoning_effort.nil?)
+    end
+
+    private def attach_raw_response_debug(result, transport:, request_body:, response_body:, streaming:, status: nil, content_type: nil)
+      return result unless @raw_response_logging
+
+      result[:raw_response_debug] = {
+        provider_id: @provider_id,
+        transport: transport,
+        streaming: streaming,
+        status: status,
+        content_type: content_type,
+        request_body: request_body,
+        response_body: response_body
+      }.compact
+      result
+    end
+
+    private def attach_sdk_raw_response_debug(result, transport:, params:, raw_payload:, streaming:)
+      return result unless @raw_response_logging
+
+      result[:raw_response_debug] = {
+        provider_id: @provider_id,
+        transport: transport,
+        streaming: streaming,
+        request_body: params,
+        response_body: serialize_debug_payload(raw_payload)
+      }.compact
+      result
+    end
+
+    private def serialize_debug_payload(payload)
+      if payload.is_a?(Array)
+        payload.map { |item| serialize_debug_payload(item) }
+      elsif payload.is_a?(Hash)
+        payload.transform_values { |value| serialize_debug_payload(value) }
+      elsif payload.respond_to?(:deep_to_h)
+        payload.deep_to_h
+      elsif payload.respond_to?(:to_h)
+        payload.to_h
+      else
+        payload
+      end
+    rescue StandardError
+      payload.inspect
     end
 
     private def emit_stream_event(observer, content_delta: nil, reasoning_delta: nil)

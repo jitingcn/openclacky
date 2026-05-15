@@ -62,7 +62,9 @@ RSpec.describe "CLI client staleness regression (DSK → Opus → /clear)" do
         base_url: agent_config.base_url,
         model: agent_config.model_name,
         anthropic_format: agent_config.anthropic_format?,
-        anthropic_stream: agent_config.anthropic_stream?
+        anthropic_stream: agent_config.anthropic_stream?,
+        thinking_enabled: agent_config.thinking_enabled,
+        reasoning_effort: agent_config.reasoning_effort
       )
     end
   end

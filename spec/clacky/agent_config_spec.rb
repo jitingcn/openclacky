@@ -195,6 +195,25 @@ RSpec.describe Clacky::AgentConfig do
           expect(config.models[0]["anthropic_format"]).to be false
         end
       end
+
+      it "loads raw_response_logging_enabled from settings" do
+        with_temp_config({
+          "settings" => {
+            "raw_response_logging_enabled" => true
+          },
+          "models" => [
+            {
+              "model" => "gpt-5.2",
+              "api_key" => "sk-key1",
+              "base_url" => "https://api.openai.com/v1"
+            }
+          ]
+        }) do |config_file|
+          config = described_class.load(config_file)
+
+          expect(config.raw_response_logging_enabled).to be(true)
+        end
+      end
     end
   end
 
@@ -209,7 +228,8 @@ RSpec.describe Clacky::AgentConfig do
               "base_url" => "https://api.test.com",
               "anthropic_format" => true
             }
-          ]
+          ],
+          raw_response_logging_enabled: true
         )
 
         config.save(config_file)
@@ -220,6 +240,7 @@ RSpec.describe Clacky::AgentConfig do
         expect(loaded_data).to be_a(Hash)
         expect(loaded_data).to have_key("settings")
         expect(loaded_data).to have_key("models")
+        expect(loaded_data["settings"]["raw_response_logging_enabled"]).to be(true)
         expect(loaded_data["models"]).to be_a(Array)
         expect(loaded_data["models"].length).to eq(1)
         expect(loaded_data["models"][0]["api_key"]).to eq("sk-test")

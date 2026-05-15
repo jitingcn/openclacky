@@ -156,11 +156,10 @@ module Clacky
     attr_accessor :permission_mode, :max_tokens, :verbose,
                   :enable_compression, :enable_prompt_caching,
                   :models, :current_model_index, :current_model_id,
-                  :memory_update_enabled, :skill_evolution,
+                  :memory_update_enabled, :skill_evolution, :raw_response_logging_enabled,
                   :compression_token_threshold, :compression_message_threshold,
                   :compression_max_recent_messages, :compression_target_tokens,
-                  :idle_compression_threshold, :idle_compression_delay,
-                  :thinking_level
+                  :idle_compression_threshold, :idle_compression_delay
 
     # Per-model compression override keys that can appear inside
     # a model entry's "compression_overrides" hash.
@@ -169,6 +168,8 @@ module Clacky
       max_recent_messages target_tokens
       idle_threshold idle_delay
     ].freeze
+
+    MODEL_REASONING_EFFORTS = %w[none minimal low medium high max xhigh].freeze
 
     # Effective (per-model-aware) accessors for compression settings.
     # Each method checks the current model's compression_overrides first;
@@ -243,8 +244,7 @@ module Clacky
       @compression_target_tokens = options[:compression_target_tokens] || 10_000
       @idle_compression_threshold = options[:idle_compression_threshold] || 20_000
       @idle_compression_delay = options[:idle_compression_delay] || 180
-      @thinking_level = normalize_thinking_level(options[:thinking_level])
-
+      @raw_response_logging_enabled = options[:raw_response_logging_enabled] || false
       # Memory and skill evolution configuration
       @memory_update_enabled = options[:memory_update_enabled].nil? ? true : options[:memory_update_enabled]
       @skill_evolution = options[:skill_evolution] || {
@@ -286,6 +286,12 @@ module Clacky
 
       # Parse models from config
       models = parse_models(data)
+
+      # Backward compatibility: older config.yml stored a global settings.thinking_level.
+      # Migrate it into per-model thinking_enabled/reasoning_effort fields at load time.
+      if loaded_settings.key?("thinking_level")
+        migrate_legacy_thinking_level!(models, loaded_settings["thinking_level"])
+      end
 
       # Priority: config file > CLACKY_XXX env vars > ClaudeCode env vars
       if models.empty?
@@ -429,8 +435,8 @@ module Clacky
     # Settings keys that are persisted to config.yml.
     # These map directly to AgentConfig accessors.
     CONFIG_SETTINGS_KEYS = %w[
-      enable_compression enable_prompt_caching memory_update_enabled
-      skill_evolution thinking_level
+      enable_compression enable_prompt_caching memory_update_enabled raw_response_logging_enabled
+      skill_evolution
       compression_token_threshold compression_message_threshold
       compression_max_recent_messages compression_target_tokens
       idle_compression_threshold idle_compression_delay
@@ -447,8 +453,8 @@ module Clacky
         "enable_compression" => @enable_compression,
         "enable_prompt_caching" => @enable_prompt_caching,
         "memory_update_enabled" => @memory_update_enabled,
+        "raw_response_logging_enabled" => @raw_response_logging_enabled,
         "skill_evolution" => @skill_evolution,
-        "thinking_level" => @thinking_level,
         "compression_token_threshold" => @compression_token_threshold,
         "compression_message_threshold" => @compression_message_threshold,
         "compression_max_recent_messages" => @compression_max_recent_messages,
@@ -459,29 +465,80 @@ module Clacky
       YAML.dump("settings" => settings, "models" => persistable_models)
     end
 
-    # Get global thinking level preference.
-    # Valid values: nil/"off", "low", "medium", "high".
-    def thinking_level
-      @thinking_level
+    # Get the current model's explicit thinking mode preference.
+    # Returns:
+    #   - true  → force thinking on
+    #   - false → force thinking off
+    #   - nil   → provider/model default behaviour
+    def thinking_enabled
+      normalize_model_thinking_enabled(current_model_value("thinking_enabled"))
     end
 
-    # Set global thinking level preference.
-    def thinking_level=(value)
-      @thinking_level = normalize_thinking_level(value)
+    # Set the current model's thinking mode preference (overlay-aware; see #api_key=).
+    def thinking_enabled=(value)
+      normalized = normalize_model_thinking_enabled(value)
+      return unless resolve_current_model_entry
+
+      target = @virtual_model_overlay || resolve_current_model_entry
+      if normalized.nil?
+        target.delete("thinking_enabled")
+      else
+        target["thinking_enabled"] = normalized
+      end
     end
 
+    # Get the current model's explicit reasoning effort preference.
+    # Returns nil when unset/"auto".
+    def reasoning_effort
+      normalize_reasoning_effort(current_model_value("reasoning_effort"))
+    end
+
+    # Set the current model's reasoning effort preference (overlay-aware; see #api_key=).
+    def reasoning_effort=(value)
+      normalized = normalize_reasoning_effort(value)
+      return unless resolve_current_model_entry
+
+      target = @virtual_model_overlay || resolve_current_model_entry
+      if normalized.nil?
+        target.delete("reasoning_effort")
+      else
+        target["reasoning_effort"] = normalized
+      end
+    end
 
     # Check if any model is configured
     def models_configured?
       !@models.empty? && !current_model.nil?
     end
 
-    private def normalize_thinking_level(value)
+    private def normalize_model_thinking_enabled(value)
+      case value
+      when true, false
+        value
+      else
+        normalized = value.to_s.strip.downcase
+        return nil if normalized.empty? || normalized == "auto"
+        return true if %w[true on yes enabled enable].include?(normalized)
+        return false if %w[false off no disabled disable].include?(normalized)
+
+        nil
+      end
+    end
+
+    private def normalize_reasoning_effort(value)
       normalized = value.to_s.strip.downcase
-      return nil if normalized.empty? || normalized == "off"
-      return normalized if %w[low medium high].include?(normalized)
+      return nil if normalized.empty? || normalized == "auto"
+      return normalized if MODEL_REASONING_EFFORTS.include?(normalized)
 
       nil
+    end
+
+    private def current_model_value(key)
+      model = current_model
+      return nil unless model.is_a?(Hash)
+      return model[key] if model.key?(key)
+
+      model[key.to_sym]
     end
 
     # Get model by index
@@ -700,7 +757,7 @@ module Clacky
       end
     end
 
-    def add_model(model:, api_key:, base_url:, anthropic_format: false, anthropic_stream: true, api_type: nil, stream: nil, prompt_caching: nil, type: nil, compression_overrides: nil)
+    def add_model(model:, api_key:, base_url:, anthropic_format: false, anthropic_stream: true, api_type: nil, stream: nil, prompt_caching: nil, thinking_enabled: nil, reasoning_effort: nil, type: nil, compression_overrides: nil)
       entry = {
         "id" => SecureRandom.uuid,
         "api_key" => api_key,
@@ -711,6 +768,8 @@ module Clacky
         "api_type" => api_type,
         "stream" => stream,
         "prompt_caching" => prompt_caching,
+        "thinking_enabled" => normalize_model_thinking_enabled(thinking_enabled),
+        "reasoning_effort" => normalize_reasoning_effort(reasoning_effort),
         "type" => type
       }.compact
       # Per-model compression overrides (optional hash)
@@ -816,6 +875,8 @@ module Clacky
         "model"            => lite_name,
         "anthropic_format" => primary["anthropic_format"] || false,
         "anthropic_stream" => primary["anthropic_stream"].nil? ? true : primary["anthropic_stream"],
+        "thinking_enabled" => primary["thinking_enabled"],
+        "reasoning_effort" => primary["reasoning_effort"],
         "virtual"          => true  # marker: not a real @models entry
       }
     end
@@ -956,7 +1017,8 @@ module Clacky
     # the forked config only — the parent config is untouched.
     #
     # @param overlay [Hash, nil] fields to overlay; pass nil or {} to clear.
-    #   Recognized keys: "api_key", "base_url", "model", "anthropic_format".
+    #   Recognized keys: "api_key", "base_url", "model", "anthropic_format",
+    #   "thinking_enabled", "reasoning_effort".
     # @return [void]
     def apply_virtual_model_overlay!(overlay)
       if overlay.nil? || overlay.empty?
@@ -1098,7 +1160,9 @@ module Clacky
                 "base_url" => config["base_url"],
                 "model" => config["model_name"] || config["model"] || tier_name,
                 "anthropic_format" => config["anthropic_format"] || false,
-                "anthropic_stream" => config.key?("anthropic_stream") ? config["anthropic_stream"] : true
+                "anthropic_stream" => config.key?("anthropic_stream") ? config["anthropic_stream"] : true,
+                "thinking_enabled" => config["thinking_enabled"],
+                "reasoning_effort" => config["reasoning_effort"]
               }
               models << model_config
             elsif config.is_a?(String)
@@ -1108,7 +1172,9 @@ module Clacky
                 "base_url" => data["base_url"],
                 "model" => config,
                 "anthropic_format" => data["anthropic_format"] || false,
-                "anthropic_stream" => data.key?("anthropic_stream") ? data["anthropic_stream"] : true
+                "anthropic_stream" => data.key?("anthropic_stream") ? data["anthropic_stream"] : true,
+                "thinking_enabled" => data["thinking_enabled"],
+                "reasoning_effort" => data["reasoning_effort"]
               }
               models << model_config
             end
@@ -1121,7 +1187,9 @@ module Clacky
           "base_url" => data["base_url"],
           "model" => data["model"] || CLAUDE_DEFAULT_MODEL,
           "anthropic_format" => data["anthropic_format"] || false,
-          "anthropic_stream" => data.key?("anthropic_stream") ? data["anthropic_stream"] : true
+          "anthropic_stream" => data.key?("anthropic_stream") ? data["anthropic_stream"] : true,
+          "thinking_enabled" => data["thinking_enabled"],
+          "reasoning_effort" => data["reasoning_effort"]
         }
       end
 
@@ -1133,6 +1201,23 @@ module Clacky
       models.each { |m| m["id"] ||= SecureRandom.uuid }
 
       models
+    end
+
+    private_class_method def self.migrate_legacy_thinking_level!(models, legacy_value)
+      normalized = legacy_value.to_s.strip.downcase
+      return if normalized.empty?
+
+      models.each do |model|
+        next if model.key?("thinking_enabled") || model.key?("reasoning_effort")
+
+        case normalized
+        when "off"
+          model["thinking_enabled"] = false
+        when "low", "medium", "high"
+          model["thinking_enabled"] = true
+          model["reasoning_effort"] = normalized
+        end
+      end
     end
   end
 end

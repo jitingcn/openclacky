@@ -118,6 +118,36 @@ RSpec.describe Clacky::Server::HttpServer do
     end
   end
 
+  describe "/api/settings" do
+    it "returns raw_response_logging_enabled in the settings payload" do
+      agent_config.raw_response_logging_enabled = true
+
+      with_server(agent_config: agent_config) do |server|
+        req = fake_req(method: "GET", path: "/api/settings")
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        expect(parsed_body(res).dig("settings", "raw_response_logging_enabled")).to be(true)
+      end
+    end
+
+    it "updates raw_response_logging_enabled via PATCH /api/settings" do
+      with_server(agent_config: agent_config) do |server|
+        req = fake_req(method: "PATCH", path: "/api/settings", body: {
+          settings: {
+            raw_response_logging_enabled: true
+          }
+        })
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        expect(agent_config.raw_response_logging_enabled).to be(true)
+      end
+    end
+  end
+
   # ── GET /api/sessions ─────────────────────────────────────────────────────
 
   describe "GET /api/sessions" do
@@ -600,6 +630,8 @@ RSpec.describe Clacky::Server::HttpServer do
         expect(m["model"]).to eq("test-model")
         expect(m["base_url"]).to eq("https://api.example.com")
         expect(m["anthropic_format"]).to be true
+        expect(m["thinking_enabled"]).to be_nil
+        expect(m["reasoning_effort"]).to be_nil
         expect(m["type"]).to eq("default")
         # API key should be masked
         expect(m["api_key_masked"]).to include("****")
@@ -630,7 +662,9 @@ RSpec.describe Clacky::Server::HttpServer do
           model:            "claude-opus-4",
           base_url:         "https://api.anthropic.com",
           api_key:          "sk-newkey0000111122223333",
-          anthropic_format: true
+          anthropic_format: true,
+          thinking_enabled: true,
+          reasoning_effort: "high"
         }
         req = fake_req(method: "POST", path: "/api/config/models", body: payload)
         res = fake_res
@@ -644,6 +678,8 @@ RSpec.describe Clacky::Server::HttpServer do
         created = agent_config.models.find { |m| m["id"] == body["id"] }
         expect(created["model"]).to eq("claude-opus-4")
         expect(created["api_key"]).to eq("sk-newkey0000111122223333")
+        expect(created["thinking_enabled"]).to eq(true)
+        expect(created["reasoning_effort"]).to eq("high")
       end
     end
 
@@ -683,6 +719,21 @@ RSpec.describe Clacky::Server::HttpServer do
         expect(agent_config.models[0]["model"]).to eq("renamed-model")
         # api_key untouched (not in payload)
         expect(agent_config.models[0]["api_key"]).to eq(original_key)
+      end
+    end
+
+    it "updates per-model thinking fields" do
+      with_server(agent_config: agent_config) do |server|
+        id = agent_config.models[0]["id"]
+
+        payload = { thinking_enabled: true, reasoning_effort: "medium" }
+        req = fake_req(method: "PATCH", path: "/api/config/models/#{id}", body: payload)
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(res.status).to eq(200)
+        expect(agent_config.models[0]["thinking_enabled"]).to eq(true)
+        expect(agent_config.models[0]["reasoning_effort"]).to eq("medium")
       end
     end
 
@@ -907,6 +958,29 @@ RSpec.describe Clacky::Server::HttpServer do
           anthropic_format: true
         }
         req = fake_req(method: "POST", path: "/api/config/test", body: payload)
+        res = fake_res
+        dispatch(server, req, res)
+
+        expect(parsed_body(res)["ok"]).to be true
+      end
+    end
+
+    it "passes raw_response_logging to config test clients" do
+      test_client = double("client", test_connection: { success: true })
+      agent_config.raw_response_logging_enabled = true
+
+      with_server(agent_config: agent_config) do |server|
+        expect(Clacky::Client).to receive(:new) do |_key, **kwargs|
+          expect(kwargs[:raw_response_logging]).to be(true)
+          test_client
+        end
+
+        req = fake_req(method: "POST", path: "/api/config/test", body: {
+          model: "test-model",
+          base_url: "https://api.example.com",
+          api_key: "sk-testkey1234567890abcd",
+          anthropic_format: true
+        })
         res = fake_res
         dispatch(server, req, res)
 

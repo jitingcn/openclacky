@@ -118,17 +118,17 @@ RSpec.describe Clacky::MessageFormat::OpenAI do
       expect(body[:messages].last[:content]).to eq("Another string")
     end
 
-    it "adds reasoning hints when thinking_level is enabled" do
+    it "adds reasoning_effort when configured" do
       messages = [
         { role: "user", content: "Hello" }
       ]
 
       body = described_class.build_request_body(
         messages, model, tools, max_tokens, false,
-        thinking_level: "medium"
+        reasoning_effort: "medium"
       )
       expect(body[:reasoning_effort]).to eq("medium")
-      expect(body[:reasoning]).to eq({ effort: "medium" })
+      expect(body).not_to have_key(:reasoning)
     end
 
     it "parses reasoning from non-streaming responses" do
