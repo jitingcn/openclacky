@@ -11,7 +11,8 @@ module Clacky
     INTERNAL_FIELDS = %i[
       task_id created_at system_injected session_context memory_update
       subagent_instructions subagent_result token_usage
-      compressed_summary chunk_path truncated transient
+      compressed_summary chunk_path truncated transient latency
+      raw_response_debug
       chunk_index chunk_count
     ].freeze
 

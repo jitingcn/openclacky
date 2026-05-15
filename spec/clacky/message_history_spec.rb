@@ -330,6 +330,28 @@ RSpec.describe Clacky::MessageHistory do
       expect(api_msgs.first[:role]).to eq("system")
     end
 
+    it "strips raw_response_debug and latency from API payloads while keeping them in stored history" do
+      history.append(user_msg("hi"))
+      history.append(
+        assistant_msg(
+          "reply",
+          raw_response_debug: {
+            transport: "openai-chat-completions",
+            response_body: "data: ...\n\n"
+          },
+          latency: { ttft_ms: 123, duration_ms: 456 }
+        )
+      )
+
+      api_msg = history.to_api.last
+      stored_msg = history.to_a.last
+
+      expect(api_msg).not_to have_key(:raw_response_debug)
+      expect(api_msg).not_to have_key(:latency)
+      expect(stored_msg[:raw_response_debug]).to include(transport: "openai-chat-completions")
+      expect(stored_msg[:latency]).to eq(ttft_ms: 123, duration_ms: 456)
+    end
+
     # ── reasoning_content consistency ────────────────────────────────────────
     #
     # Thinking-mode providers (DeepSeek V4, Kimi K2 thinking, etc.) return a
