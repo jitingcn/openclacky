@@ -123,6 +123,8 @@ module Clacky
       def show_tool_call(name, args)
         args_data = args.is_a?(String) ? (JSON.parse(args) rescue args) : args
 
+        flush_live_assistant_stream_to_browser
+
         # Special handling for request_user_feedback — emit a dedicated UI event
         if name.to_s == "request_user_feedback"
           question = args_data.is_a?(Hash) ? (args_data[:question] || args_data["question"]).to_s : ""
@@ -440,6 +442,23 @@ module Clacky
       def emit(type, **data)
         event = { type: type, session_id: @session_id }.merge(data)
         @broadcaster.call(@session_id, event)
+      end
+
+      # Streaming reasoning-only turns do not call show_assistant_message,
+      # so finalize the current stream before the first tool event. This
+      # keeps the completed reasoning bubble anchored near the related tool
+      # output and lets the next post-tool reasoning start in a new bubble.
+      def flush_live_assistant_stream_to_browser
+        stream = @live_assistant_stream
+        return unless stream
+
+        @live_assistant_stream = nil
+        emit(
+          "assistant_message",
+          content: stream[:content].to_s,
+          files: [],
+          reasoning_content: stream[:reasoning_content].to_s
+        )
       end
 
       # Forward a UIInterface call to all registered channel subscribers.
